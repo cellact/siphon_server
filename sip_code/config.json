@@ -1,0 +1,26 @@
+{
+  "development": {
+    "common": {
+      "domain": "test2.cellact.nl",
+      "publicIp": "3.125.225.232",
+      "bindIp": "172.31.24.141",
+      "wssPort": 8443,
+      "tlsCertPath": "/etc/letsencrypt/live/test2.cellact.nl",
+      "rtpengineAddress": "3.125.225.232:2223",
+      "webrtcServiceHost": "172.31.24.141",
+      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+    }
+  },
+  "production": {
+    "common": {
+      "domain": "ron1.cellact.nl",
+      "publicIp": "51.17.152.103",
+      "bindIp": "172.31.6.219",
+      "wssPort": 8443,
+      "tlsCertPath": "/etc/letsencrypt/live/ron1.cellact.nl",
+      "rtpengineAddress": "127.0.0.1:22222",
+      "webrtcServiceHost": "172.31.6.219",
+      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+    }
+  }
+}

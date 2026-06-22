@@ -1,0 +1,711 @@
+# siphon.yaml — SIPhon reference configuration
+#
+# This is the canonical reference showing every supported and planned option.
+# Commented-out sections are planned (not yet parsed by the runtime).
+# Copy and uncomment what you need; delete everything else.
+#
+# Hot-reload: all sections except `listen` can be changed without restart.
+# (Transport listeners require a full restart to rebind.)
+#
+# Environment variable expansion:
+#   Any value can reference environment variables with ${VAR} syntax.
+#   Use ${VAR:-default} to provide a fallback when the variable is unset or empty.
+#
+#   Examples:
+#     url: "redis://${REDIS_HOST:-localhost}:6379"
+#     - "${LISTEN_IP:-0.0.0.0}:5060"
+#     cert: "${TLS_CERT_PATH:-/etc/siphon/tls/cert.pem}"
+
+# ---------------------------------------------------------------------------
+# Transport listeners
+# ---------------------------------------------------------------------------
+listen:
+  # DSCP / DiffServ marking for SIP signaling packets (RFC 4594 §4.1).
+  # Accepts a DSCP name (CS3, EF, AF41, …) or a raw integer 0–63.
+  # Default: CS3 (24) → TOS byte 96 — RFC 4594 "Signaling" service class.
+  # Set to 0 or "BE" (Best Effort) to disable marking.
+  # Per-listener overrides are possible in the extended form (see below).
+  dscp: CS3
+  udp:
+    - "0.0.0.0:5060"    # Standard SIP (PSTN gateways, legacy UEs)
+    # - "[::]:5060"      # Dual-stack IPv6 (accepts both IPv4 and IPv6)
+    # - "[2001:db8::1]:5060"  # Specific IPv6 address
+  tcp:
+    - "0.0.0.0:5060"    # SIP over TCP (AS internal leg, modern UEs)
+    # - "[::]:5060"      # Dual-stack IPv6 over TCP
+  # tls:
+  #   - "0.0.0.0:5061"  # SIP over TLS — requires tls: cert/key block below
+  #   - "[::]:5061"      # IPv6 TLS
+  # ws:
+  #   - "0.0.0.0:80"    # SIP over WebSocket (RFC 7118, browser UEs)
+  # wss:
+  #   - "0.0.0.0:443"   # SIP over Secure WebSocket
+  #                      # WSS shares the TLS cert from the `tls:` block below.
+  #                      # It's a separate listener because the HTTP upgrade
+  #                      # handshake differs from raw SIP/TLS.
+  #
+  # Per-socket advertised address (like OpenSIPS `socket ... as ...`).
+  # Use when the bind IP differs from what external peers should see
+  # in Record-Route / Via (e.g. cloud instances, NAT, split-horizon DNS).
+  #
+  # Example — internal TCP, public-facing TLS with per-listener DSCP override:
+  #   tcp:
+  #     - "10.0.0.1:5060"                            # plain string = no advertise
+  #   tls:
+  #     - address: "10.0.0.1:5061"                    # extended form
+  #       advertise: "sip.example.com"                # hostname or IP for Record-Route
+  #       dscp: EF                                    # per-listener override (default is global dscp)
+  #
+  # The global `advertised_address` (below) serves as fallback for transports
+  # that don't have a per-socket advertise.
+
+# ---------------------------------------------------------------------------
+# Network identity
+# ---------------------------------------------------------------------------
+domain:
+  local:
+    - "example.com"     # SIP domain served by this instance
+    - "127.0.0.1"       # Local IP for loop detection
+
+# Public IP advertised in Via / Contact / SDP when binding 0.0.0.0 or [::].
+# Needed on cloud instances (EC2, GCE) where the bound IP is private.
+# advertised_address: "1.2.3.4"
+# advertised_address: "2001:db8::1"  # IPv6 public address
+
+# ---------------------------------------------------------------------------
+# TLS certificate (required when listen.tls or listen.wss is set)
+# ---------------------------------------------------------------------------
+# tls:
+#   certificate: "/etc/siphon/tls/example.com.crt"
+#   private_key:  "/etc/siphon/tls/example.com.key"
+#   method: "TLSv1_3"     # TLSv1_2 | TLSv1_3
+#   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
+
+# ---------------------------------------------------------------------------
+# Python script
+# ---------------------------------------------------------------------------
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto    # auto = inotify (change without restart) | sighup = signal only
+  # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.
+  # No YAML config needed — all parameters are per-decorator in the script.
+  # See examples/timer_example.py for usage patterns.
+
+# ---------------------------------------------------------------------------
+# Registrar
+# ---------------------------------------------------------------------------
+registrar:
+  backend: memory   # memory | redis | postgres | python (custom hook)
+  default_expires: 3600   # seconds; used when client omits Expires header
+  max_expires: 7200        # reject/clamp registrations above this
+  # min_expires: 60        # reject with 423 Interval Too Brief if below this
+  # max_contacts: 1        # evict existing contacts if above limit (omit = unlimited)
+
+  # Redis persistence (backend: redis)
+  # Survives restarts; required when RTPEngine or dialog state also uses Redis.
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
+  #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+
+  # PostgreSQL persistence (backend: postgres)
+  # postgres:
+  #   url: "postgres://user:pass@localhost/siphon"
+  #   table: "registrar"
+
+  # Registration liveness — network-initiated deregistration when a UE
+  # vanishes without a SIP de-REGISTER (default off until proven in the field).
+  # With it off, siphon behaves exactly as before (Expires-only).
+  #   - TCP/TLS/WS/WSS: the binding is removed when its inbound connection
+  #     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+  #     failure) — RFC 5626 §4.2.2 flow failure.
+  #   - UDP+IPsec (Gm): an idle binding is detected by polling the kernel XFRM
+  #     SA inbound use-time (no per-packet cost; the UE's RFC 6223 keepalive
+  #     keeps the SA warm). Silence beyond idle_multiplier × keepalive_interval
+  #     triggers one OPTIONS probe; no answer → deregister.
+  # liveness:
+  #   enabled: false               # master switch
+  #   keepalive_interval_secs: 30  # RFC 6223 Flow-Timer / NAT keepalive cadence
+  #   idle_multiplier: 3           # grace = idle_multiplier × keepalive (~90 s)
+  #   probe_timeout_ms: 2000       # per-attempt OPTIONS probe timeout
+  #   dereg_mode: network_dereg    # network_dereg | local_only
+  #     # network_dereg: a P-CSCF cache binding also synthesizes a de-REGISTER
+  #     #   (Expires: 0) toward the S-CSCF via the stored Service-Route, so the
+  #     #   registrar of record clears the binding too.
+  #     # local_only: drop local state + emit on_change only (use on the box
+  #     #   that IS the registrar of record).
+
+# ---------------------------------------------------------------------------
+# Registrant — Outbound REGISTER Client (Carrier Trunk Registration)
+# ---------------------------------------------------------------------------
+# Maintains outbound REGISTER sessions to upstream registrars (carrier trunks,
+# peering partners). Each entry sends periodic REGISTER requests and handles
+# 401 digest challenges automatically. Exponential backoff on failure.
+#
+# Static entries (known at deploy time):
+#
+# registrant:
+#   default_interval: 3600            # default re-REGISTER interval (seconds)
+#   retry_interval: 60                # base retry on failure (seconds)
+#   max_retry_interval: 300           # backoff cap (seconds)
+#   entries:
+#     - aor: "sip:trunk1@carrier.com"
+#       registrar: "sip:registrar.carrier.com:5060"
+#       user: "trunk1"
+#       password: "secret123"
+#       realm: "carrier.com"          # optional — derived from 401 challenge if omitted
+#       interval: 1800                # optional — overrides default_interval
+#       contact: "sip:trunk1@1.2.3.4" # optional — auto-generated if omitted
+#       transport: "udp"              # "udp" (default), "tcp", "tls"
+#
+#     - aor: "sip:trunk2@peer.net"
+#       registrar: "sip:peer.net:5060"
+#       user: "trunk2"
+#       password: "p33rsecret"
+#       transport: "tcp"
+#
+# Dynamic entries (loaded from database at runtime):
+# Use the `registration` Python API to add/remove entries from scripts.
+# This is useful when trunk credentials are stored in a database and may
+# change without redeploying config. Entries added via Python are identical
+# to YAML-configured ones.
+#
+#   from siphon import registration, timer
+#
+#   def load_trunks():
+#       import sqlite3  # or psycopg2, mysql.connector, etc.
+#       conn = sqlite3.connect("/etc/siphon/trunks.db")
+#       current = {r["aor"] for r in registration.list()}
+#       db_aors = set()
+#       for aor, registrar, user, pw, interval, transport in conn.execute(
+#           "SELECT aor, registrar, user, password, interval, transport "
+#           "FROM trunks WHERE enabled = 1"
+#       ):
+#           db_aors.add(aor)
+#           if aor not in current:
+#               registration.add(aor, registrar, user=user, password=pw,
+#                                interval=interval, transport=transport)
+#       for aor in current - db_aors:
+#           registration.remove(aor)
+#
+#   load_trunks()                           # once at script load
+#
+#   @timer.every(seconds=300, name="trunk_sync")
+#   def sync_trunks():
+#       load_trunks()                       # periodic re-sync
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+auth:
+  realm: "example.com"
+  backend: static   # static | http | database | diameter_cx
+
+  # Static credentials (dev / bring-up only)
+  users:
+    alice: "secret"
+    bob: "secret"
+    # bob1..bob16 — used by scripts/scale_test.sh to spread load across N UAS processes
+    bob1: "secret"
+    bob2: "secret"
+    bob3: "secret"
+    bob4: "secret"
+    bob5: "secret"
+    bob6: "secret"
+    bob7: "secret"
+    bob8: "secret"
+    bob9: "secret"
+    bob10: "secret"
+    bob11: "secret"
+    bob12: "secret"
+    bob13: "secret"
+    bob14: "secret"
+    bob15: "secret"
+    bob16: "secret"
+    bob17: "secret"
+    bob18: "secret"
+    bob19: "secret"
+    bob20: "secret"
+    bob21: "secret"
+    bob22: "secret"
+    bob23: "secret"
+    bob24: "secret"
+    bob25: "secret"
+    bob26: "secret"
+    bob27: "secret"
+    bob28: "secret"
+    bob29: "secret"
+    bob30: "secret"
+    bob31: "secret"
+    bob32: "secret"
+
+  # REST credential lookup (backend: http)
+  # GET {url} with {username} substituted → returns password or HA1.
+  # http:
+  #   url: "http://127.0.0.1:8000/sip/auth/{username}"
+  #   timeout_ms: 2000
+  #   connect_timeout_ms: 500
+  #   ha1: true   # true = response body is pre-hashed HA1 hex string
+
+# ---------------------------------------------------------------------------
+# Security — rate limiting, scanner blocking, trust lists
+# ---------------------------------------------------------------------------
+# security:
+#   rate_limit:
+#     window_secs: 10
+#     max_requests: 30          # requests per source IP per window
+#     ban_duration_secs: 3600   # how long to block after exceeding limit
+#
+#   scanner_block:
+#     user_agents:              # drop requests before any processing
+#       - "sipvicious"
+#       - "friendly-scanner"
+#       - "VaxSip"
+#       - "sipcli"
+#
+#   trusted_cidrs:              # bypass rate limiting (AS, monitoring)
+#     - "10.0.0.0/8"
+#
+#   failed_auth_ban:            # block IP after N failed auth attempts
+#     threshold: 10
+#     ban_duration_secs: 300
+#
+#   apiban:                     # APIBAN community blocklist (apiban.org)
+#     api_key: "your-api-key"   # get a free key at apiban.org
+#     interval_secs: 300        # poll interval (default: 300 = 5 min)
+
+# ---------------------------------------------------------------------------
+# NAT traversal
+# ---------------------------------------------------------------------------
+# nat:
+#   force_rport: true       # always rewrite Via/Contact port from observed source
+#   fix_contact: true       # rewrite Contact URI host:port with observed source
+#   fix_register: true      # rewrite Contact on REGISTER with observed source
+#   keepalive:
+#     enabled: true
+#     interval_secs: 30     # send OPTIONS to each registered contact
+#     failure_threshold: 10 # deregister contact after N consecutive failures
+#   crlf_keepalive:
+#     enabled: true
+#     interval_secs: 30     # RFC 5626 §4.4.1 CRLF ping on TCP/TLS connections
+#     failure_threshold: 3  # close connection after N missed pongs
+
+# ---------------------------------------------------------------------------
+# SIP transaction layer
+# ---------------------------------------------------------------------------
+# transaction:
+#   timeout_secs: 5        # non-INVITE transaction timeout (fr_timeout)
+#   invite_timeout_secs: 30  # INVITE transaction timeout (fr_inv_timeout)
+#   auto_emit_100_trying: true             # NIST auto-emits 100 Trying on slow relays
+#                                          # (suppresses UAC retransmits, RFC 3261 §17.1.2)
+#   auto_emit_100_trying_delay_ms: 200     # mirrors RFC 3261 §17.2.1 IST timer
+
+# ---------------------------------------------------------------------------
+# Session timers (RFC 4028) — B2BUA mode only
+# ---------------------------------------------------------------------------
+# session_timer:
+#   session_expires: 1800   # default Session-Expires value in seconds
+#   min_se: 90              # minimum acceptable Session-Expires (Min-SE header)
+#   refresher: uac          # who refreshes: uac (default) or uas
+#   enabled: true           # set to false to disable session timers
+
+# ---------------------------------------------------------------------------
+# Dialog state
+# ---------------------------------------------------------------------------
+# dialog:
+#   backend: memory   # memory | redis | postgres
+#   # redis:
+#   #   url: "redis://127.0.0.1:6379/0"
+
+# ---------------------------------------------------------------------------
+# Named cache connections (available to Python scripts via cache.fetch)
+#
+# In script: from siphon import cache
+#            result = await cache.fetch("myconn", "key")
+# ---------------------------------------------------------------------------
+# cache:
+#   - name: "cnam"
+#     url: "redis://127.0.0.1:6379"
+#     local_ttl_secs: 60       # optional in-process LRU in front of Redis
+#     local_max_entries: 10000
+
+# ---------------------------------------------------------------------------
+# Media (RTPEngine)
+# ---------------------------------------------------------------------------
+# Single instance:
+# media:
+#   rtpengine:
+#     address: "127.0.0.1:22222"   # NG control protocol (UDP)
+#     timeout_ms: 1000              # NG protocol response timeout
+#   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
+#                                   # (masks remote endpoint identity, default: "SIPhon")
+#   health_check_interval_secs: 5  # NG `ping` probe interval per instance (default 5).
+#                                   # Set 0 to disable.  Results are exported as
+#                                   # siphon_rtpengine_instances_up (count) and
+#                                   # siphon_rtpengine_instance_up{address} (per instance).
+#
+# Multiple instances (weighted round-robin):
+# media:
+#   rtpengine:
+#     instances:
+#       - address: "10.0.0.1:22222"
+#         weight: 2
+#       - address: "10.0.0.2:22222"
+#         weight: 1
+#         timeout_ms: 2000
+#
+# Custom media profiles (extend or override built-ins):
+#
+# Built-in profiles (always available):
+#   rtp_passthrough — Plain RTP both sides, media anchoring only (default)
+#   srtp_to_rtp     — SRTP UE ↔ RTP core
+#   ws_to_rtp       — WebSocket UE (RTP/AVPF + ICE) ↔ RTP core
+#   wss_to_rtp      — Secure WebSocket UE (DTLS-SRTP/AVPF + ICE) ↔ RTP core
+#
+# Define custom profiles under media.profiles:
+# media:
+#   rtpengine:
+#     address: "127.0.0.1:22222"
+#   profiles:
+#     srtp_to_srtp:
+#       offer:
+#         transport_protocol: "RTP/SAVP"
+#         ice: "remove"
+#         replace: ["origin"]
+#         direction: ["external", "internal"]
+#       answer:
+#         transport_protocol: "RTP/SAVP"
+#         ice: "remove"
+#         replace: ["origin"]
+#         direction: ["internal", "external"]
+#
+# Python usage:
+#   rtpengine.offer(request, profile="srtp_to_srtp")
+#   rtpengine.answer(reply, profile="srtp_to_srtp")
+
+# ---------------------------------------------------------------------------
+# SIP tracing via HEP (Homer / captAgent)
+# ---------------------------------------------------------------------------
+# tracing:
+#   hep:
+#     endpoint: "127.0.0.1:9060"   # Address of the Homer/heplify-server collector
+#     version: 3                    # HEP protocol version (only v3 supported)
+#     transport: udp                # udp | tcp | tls
+#     agent_id: "siphon"            # Label in Homer — use per-role names
+#                                   # (siphon-registrar, siphon-sbc, etc.)
+#                                   # so multiple nodes appear separately
+#     # ca_cert: /etc/ssl/homer-ca.pem      # CA for TLS transport (default: system roots)
+#     # tls_server_name: homer.example.com  # SNI for TLS (default: endpoint host)
+#     # error_log_interval: 30              # Seconds between repeated error logs (default: 30)
+
+# ---------------------------------------------------------------------------
+# Server identity headers
+# ---------------------------------------------------------------------------
+# server:
+#   server_header: "SIPhon/0.1.0"    # default: "SIPhon/<cargo version>"
+#   user_agent_header: "SIPhon/0.1.0" # default: "SIPhon/<cargo version>"
+#   drain_secs: 30                    # Graceful shutdown drain (seconds).
+#                                     # On SIGTERM/SIGINT, stop accepting new INVITEs
+#                                     # (503 Service Unavailable) and wait up to this
+#                                     # many seconds for in-flight transactions and
+#                                     # B2BUA calls to finish before exiting. Default
+#                                     # 30s. Set to 0 to exit immediately on signal.
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+# metrics:
+#   prometheus:
+#     listen: "0.0.0.0:8888"
+#     path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# Gateway dispatcher (named groups with load balancing + health probing)
+# ---------------------------------------------------------------------------
+# gateway:
+#   groups:
+#     - name: "carriers"
+#       algorithm: weighted       # round_robin | weighted (default) | hash
+#       probe:
+#         enabled: true           # SIP OPTIONS health probing
+#         interval_secs: 15       # probe every 15 seconds
+#         failure_threshold: 3    # mark down after 3 consecutive failures
+#         from_user: "siphon"     # user part in From URI of OPTIONS probes
+#         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
+#       destinations:
+#         - uri: "sip:gw1.carrier.com:5060"         # port + transport derived from URI
+#           weight: 3             # higher = more traffic (weighted algorithm)
+#           priority: 1           # lower = higher priority (failover tiers)
+#           attrs:                # user-defined metadata for filtering
+#             region: "us-east"
+#             type: "pstn"
+#         - uri: "sip:gw2.carrier.com:5061;transport=tls"  # TLS on 5061
+#           weight: 1
+#           priority: 2           # failover tier — only used when tier 1 is down
+#
+#         # Optional explicit overrides (normally derived from URI):
+#         # address: "10.0.0.1:5060"   # bypass DNS, send to this IP:port
+#         # transport: tls             # override URI transport param
+#
+#     - name: "sbc-pool"
+#       algorithm: hash           # hash on call-id for sticky sessions
+#       destinations:
+#         - uri: "sip:sbc1.example.com:5060"
+#           address: "10.1.0.1:5060"
+#         - uri: "sip:sbc2.example.com:5060"
+#           address: "10.1.0.2:5060"
+#
+# Python usage:
+#   from siphon import gateway
+#   gw = gateway.select("carriers")                          # weighted
+#   gw = gateway.select("sbc-pool", key=request.call_id)    # hash sticky
+#   gw = gateway.select("carriers", attrs={"region": "us-east"})  # filter
+
+# ---------------------------------------------------------------------------
+# Call Detail Records (CDR) — billing and accounting
+# ---------------------------------------------------------------------------
+# CDRs are written asynchronously via a bounded channel (never blocks calls).
+# Each CDR is a JSON object with: timestamp, call_id, from_uri, to_uri, ruri,
+# method, response_code, timestamp_start/answer/end, duration_secs, source_ip,
+# destination_ip, transport, user_agent, auth_user, disconnect_initiator,
+# sip_reason, plus any extra fields added by scripts.
+#
+# File backend (JSON-lines):
+# cdr:
+#   enabled: true
+#   include_register: false       # generate CDRs for REGISTER events too
+#   channel_size: 10000           # async buffer (drop CDR if full)
+#   backend: file
+#   file:
+#     path: "/var/log/siphon/cdr.jsonl"
+#     rotate_size_mb: 100
+#
+# HTTP webhook (POST JSON to a collector):
+# cdr:
+#   enabled: true
+#   backend: http
+#   http:
+#     url: "https://collector.example.com/v1/cdr"
+#     auth_header: "Bearer tok123"
+#
+# UDP syslog:
+# cdr:
+#   enabled: true
+#   backend: syslog
+#   syslog:
+#     target: "10.0.0.5:514"
+#
+# Python usage:
+#   from siphon import cdr
+#   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})
+
+# ---------------------------------------------------------------------------
+# SRS — Session Recording Server (RFC 7866 SIPREC)
+# ---------------------------------------------------------------------------
+# Enables Siphon to act as an SRS (Session Recording Server), accepting
+# inbound SIPREC INVITEs from external SRCs (Session Recording Clients).
+# Parses RFC 7866 metadata XML, captures audio per leg via RTPEngine's
+# record-call feature, and stores recordings + metadata grouped by call ID.
+#
+# Python script hooks:
+#   from siphon import srs
+#   @srs.on_invite                    # accept/reject incoming recording
+#   @srs.on_session_end               # post-processing after recording ends
+#
+# srs:
+#   enabled: false                    # master switch (disabled by default)
+#   recording_dir: "/var/lib/siphon/recordings"  # base directory for recordings
+#   max_sessions: 1000                # maximum concurrent recording sessions
+#   rtpengine_profile: "srs_recording"  # RTPEngine media profile to use
+#   backend: file                     # storage backend: "file" or "http"
+#   file:
+#     base_dir: "/var/lib/siphon/recordings"
+#   http:
+#     url: "https://api.example.com/recordings"
+#     auth_header: "Bearer tok123"    # optional Authorization header
+#     upload_audio: false             # upload audio files with metadata
+
+# ---------------------------------------------------------------------------
+# Lawful Intercept — ETSI X1/X2/X3 + SIPREC (RFC 7866)
+# ---------------------------------------------------------------------------
+# Implements the three ETSI LI interfaces:
+#   X1 (TS 103 221-1) — Admin: provision/modify/deactivate intercept targets
+#   X2 (TS 102 232-5) — IRI: real-time signaling events (ASN.1/BER over TCP/TLS)
+#   X3 (TS 102 232-1) — CC: media content (RTPEngine recording + encapsulation)
+#   SIPREC (RFC 7866) — SIP-based media recording to SRS
+#
+# LI is triggered per-call from the Python script:
+#   from siphon import li
+#   if li.is_target(request):            # check against X1-provisioned targets
+#       li.intercept(request)            # start IRI + CC for this call
+#   li.intercept(call)                   # B2BUA variant
+#
+# lawful_intercept:
+#   enabled: false                       # master switch (disabled by default)
+#   audit_log: "/var/log/siphon/li-audit.log"  # mandatory audit trail
+#
+#   # X1: ETSI TS 103 221-1 — admin interface for intercept provisioning
+#   x1:
+#     listen: "127.0.0.1:8443"           # separate HTTPS listener (not main admin)
+#     tls:
+#       certificate: "/etc/siphon/li/x1.crt"
+#       private_key: "/etc/siphon/li/x1.key"
+#       verify_client: true              # mTLS required for LEA authentication
+#     auth_token: "warrant-auth-xyz"     # additional bearer token
+#
+#   # X2: ETSI TS 102 232-5 — IRI (signaling events) delivery
+#   x2:
+#     delivery_address: "10.0.0.50:6543" # mediation device IRI collector
+#     transport: tcp                      # tcp | tls
+#     reconnect_interval_secs: 5
+#     channel_size: 10000
+#     # tls:
+#     #   ca_cert: "/etc/siphon/li/mediation-ca.pem"
+#
+#   # X3: ETSI TS 102 232-1 — CC (media content) delivery
+#   x3:
+#     listen_udp: "127.0.0.1:0"          # local UDP for RTPEngine mirror reception
+#     delivery_address: "10.0.0.50:6544"  # mediation device CC collector
+#     transport: udp                       # udp | tcp
+#     encapsulation: etsi                  # etsi (TS 102 232 CC-PDU) | raw_ip
+#
+#   # SIPREC: RFC 7866 — SIP-based media recording
+#   siprec:
+#     srs_uri: "sip:srs@recorder.example.com"
+#     session_copies: 1                   # parallel recording sessions per call
+#     transport: tcp                       # transport for SRS INVITE
+#     rtpengine_profile: siprec_src       # RTPEngine profile for subscribe (media fork)
+
+# ---------------------------------------------------------------------------
+# Diameter peer connections and application routing
+# ---------------------------------------------------------------------------
+# SIPhon connects outbound to Diameter peers (HSS, OCS, PCRF, CDF) and uses
+# the routing table to select which peer(s) handle each application interface.
+#
+# Supported applications: cx (HSS auth/reg), sh (HSS user data),
+#   ro (online charging), rf (offline charging), rx (QoS policy).
+#
+# diameter:
+#   origin_host: "siphon.ims.example.com"
+#   origin_realm: "ims.example.com"
+#   product_name: "SIPhon"              # advertised in CER/CEA (default: SIPhon)
+#   transport: tcp                       # tcp | sctp (default for all peers)
+#   watchdog_interval: 30                # DWR/DWA interval in seconds
+#   reconnect_delay: 5                   # seconds between reconnect attempts
+
+#   peers:
+#     - name: "hss1"
+#       host: "hss1.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+
+#     - name: "hss2"
+#       host: "hss2.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+
+#     - name: "ocs1"
+#       host: "ocs.example.com"
+#       port: 3868
+#       destination_realm: "charging.example.com"
+
+#     - name: "pcrf1"
+#       host: "pcrf.example.com"
+#       port: 3868
+#       destination_realm: "example.com"
+#       transport: sctp                  # per-peer override
+
+#     - name: "cdf1"
+#       host: "cdf.example.com"
+#       port: 3868
+#       destination_realm: "charging.example.com"
+
+#   routes:
+#     - application: cx                  # HSS: MAR/SAR/UAR/LIR
+#       realm: "example.com"             # optional realm filter
+#       peers: ["hss1", "hss2"]          # failover order
+#       algorithm: failover              # failover (default) | round_robin
+
+#     - application: sh                  # HSS: UDR/PUR/SNR
+#       peers: ["hss1"]
+
+#     - application: ro                  # OCS: CCR/CCA
+#       peers: ["ocs1"]
+
+#     - application: rx                  # PCRF: AAR/STR/RAR/ASR
+#       peers: ["pcrf1"]
+
+#     - application: rf                  # CDF: ACR/ACA
+#       peers: ["cdf1"]
+
+# ---------------------------------------------------------------------------
+# Rf — IMS offline charging (3GPP TS 32.299)
+# ---------------------------------------------------------------------------
+# When `enabled: true`, siphon emits Accounting-Request records to the
+# CDF on the lifecycle events selected below.  Scripts can also call
+# `diameter.rf_acr_start/interim/stop/event(...)` directly regardless of
+# this block — the auto-emit knobs only control whether siphon emits
+# automatically without script involvement.
+#
+# Without `diameter:` peers configured, `rf.enabled: true` logs a warning
+# and stays disabled (auto-emit needs a CDF connection).
+#
+# rf:
+#   enabled: true                         # default: false
+#   auto_emit_register: true              # ACR-EVENT on registrar state change
+#   auto_emit_proxy: true                 # ACR-START/STOP from proxy 2xx-forward + in-dialog BYE
+#   auto_emit_b2bua: true                 # ACR-START/STOP from B2BUA Answered/Bye/Terminated
+#   interim_interval_secs: 0              # 0 = disabled; CDF Acct-Interim-Interval overrides
+#   node_functionality: scscf             # scscf|pcscf|icscf|mrfc|mgcf|bgcf|as|ibcf|ecscf|atcf|mmtel|tpf|atgw
+#   service_context_id: "32260@3gpp.org"  # TS 32.260 IMS = 32260, MMTel SC = 32274
+#   peer: cdf1                            # explicit peer; default = first registered
+
+# ---------------------------------------------------------------------------
+# ISC — Initial Filter Criteria (3GPP TS 29.228)
+# ---------------------------------------------------------------------------
+# Initial Filter Criteria define which Application Servers a SIP request must
+# be routed through at the S-CSCF. iFCs are typically downloaded per-user from
+# the HSS via Diameter Cx SAR, but can also be loaded from static XML.
+#
+# When the registrar backend is Redis, iFC profiles are automatically persisted
+# and restored on restart (avoids HSS storm on S-CSCF restart).
+#
+# isc:
+#   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
+#   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
+#   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+
+# ---------------------------------------------------------------------------
+# STIR/SHAKEN — caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074)
+# ---------------------------------------------------------------------------
+# Drives the `stir` Python namespace: stir.sign() / stir.sign_div() add the
+# Identity header to outbound INVITEs (Authentication Service); stir.verify()
+# validates inbound Identity headers (Verification Service).  Either side may
+# be omitted.  Script-driven — the script owns attestation logic and the
+# reject-on-fail policy.
+#
+# stir:
+#   enabled: true                  # default true when the block is present
+#   signing:                       # omit to disable the AS side
+#     private_key: "/etc/siphon/stir/sti.key"   # PEM EC P-256 private key
+#     x5u: "https://cert.example.com/sti.pem"    # public cert URL (Identity info=)
+#     default_attestation: "A"     # A (full) | B (partial) | C (gateway)
+#     # origid: "…"                # fixed UUID; per-call v4 if unset
+#   verification:                  # omit to disable the VS side
+#     trust_anchors:               # STI-CA root certificate files (PEM)
+#       - "/etc/siphon/stir/sti-ca-root.pem"
+#     # trust_anchor_dir: "/etc/siphon/stir/anchors"  # optional dir of PEM roots
+#     freshness_secs: 60           # PASSporT iat freshness window (ATIS-1000074)
+#     permissive: false            # log-only rollout: x5u/infra failures →
+#                                  #   No-TN-Validation instead of …-Failed
+#     cache_ttl_secs: 3600         # x5u cert cache TTL (Cache-Control overrides)
+#     max_cert_bytes: 65536        # x5u response size cap
+#     require_tnauthlist: false    # require RFC 8226 TNAuthList on the leaf
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info      # debug | info | warn | error
+  format: pretty   # pretty (human-readable) | json (structured, for log aggregators)
+  # file: /var/log/siphon.log   # optional: also write logs to file (for logrotate)

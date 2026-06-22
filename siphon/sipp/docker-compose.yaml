@@ -1,0 +1,1958 @@
+# sipp/docker-compose.yaml — SIPhon functional test stack
+#
+# Usage:
+#   docker compose -f sipp/docker-compose.yaml build
+#   docker compose -f sipp/docker-compose.yaml up -d siphon
+#   docker compose -f sipp/docker-compose.yaml run --rm sipp-options
+#   docker compose -f sipp/docker-compose.yaml run --rm sipp-register
+#   docker compose -f sipp/docker-compose.yaml down
+#
+# IPsec tests (requires CAP_NET_ADMIN):
+#   docker compose -f sipp/docker-compose.yaml --profile ipsec run --rm sipp-ipsec
+
+services:
+  # ── SIPhon under test ──────────────────────────────────────────────────────
+  siphon:
+    build:
+      context: ..
+    container_name: siphon-test
+    volumes:
+      - ./configs/siphon.test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.10
+    healthcheck:
+      # Minimal UDP OPTIONS probe — just check the process is listening
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  # ── Basic SIPp tests ───────────────────────────────────────────────────────
+
+  sipp-options:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.20
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/options.xml
+      - -m
+      - "5"
+      - -l
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+
+  sipp-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.21
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "15"
+      - -trace_err
+
+  # ── Call test (UAC + UAS through siphon) ───────────────────────────────────
+  # Requires both alice and bob to be registered first.
+  # Run sipp-register before this.
+
+  sipp-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.22
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/invite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - call
+
+  sipp-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+      sipp-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.23
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/invite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - call
+
+  # ── Presence/event tests (SUBSCRIBE/NOTIFY/MESSAGE through siphon) ────────
+  # First register alice so the proxy can look up her contact,
+  # then run subscribe UAC+UAS and message through the proxy.
+
+  sipp-subscribe-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.24
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/subscribe_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - presence
+
+  sipp-subscribe-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+      sipp-subscribe-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.25
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/subscribe_uac.xml
+      - -s
+      - alice
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - presence
+
+  # Register alice with Contact pointing to 172.20.0.26:5060 (the message UAS)
+  sipp-message-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.28
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/message_contact.csv
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - presence
+
+  # UAS at 172.20.0.26:5060 — receives MESSAGE relayed by proxy
+  sipp-message-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.26
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/message_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - presence
+
+  # UAC sends MESSAGE to alice@proxy — proxy relays to 172.20.0.26
+  sipp-message-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.27
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/message.xml
+      - -s
+      - alice
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "15"
+      - -trace_err
+    profiles:
+      - presence
+
+  # ── NIST auto-100 Trying test ──────────────────────────────────────────────
+  # Sends a MESSAGE that the UAS deliberately stalls 500 ms before answering.
+  # The proxy's NIST auto-100 timer (default 200 ms) must fire and produce a
+  # 100 Trying upstream; the UAC's scenario requires the 100 before the 200.
+
+  # Register alice with Contact pointing to 172.20.0.36:5060 (slow UAS)
+  sipp-message-auto100-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.38
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/message_auto100_contact.csv
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - auto100
+
+  # Slow MESSAGE UAS at 172.20.0.36:5060 — pauses 500 ms before 200 OK
+  sipp-message-auto100-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-auto100-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.36
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/message_auto100_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - auto100
+
+  # UAC — requires 100 Trying from proxy before the upstream UAS's 200 OK
+  sipp-message-auto100-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-auto100-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.37
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/message_auto100.xml
+      - -s
+      - alice
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "15"
+      - -trace_err
+    profiles:
+      - auto100
+
+  # ── UAS To-tag stamping test ───────────────────────────────────────────────
+  # Sends MESSAGE to an unregistered user; siphon's script replies 404 itself
+  # so the response is fully script-built. Asserts the 404's To header carries
+  # a non-empty tag (RFC 3261 §8.2.6.2 — UAS MUST add To-tag on every response
+  # except 100 Trying).
+  sipp-message-404-to-tag:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.39
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/message_404_to_tag.xml
+      - -s
+      - nobody
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - auto100
+
+  # ── PUBLISH test (RFC 3903 presence publication) ───────────────────────────
+
+  sipp-publish:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.29
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/publish.xml
+      - -s
+      - alice
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "15"
+      - -trace_err
+    profiles:
+      - presence
+
+  # ── INVITE with proxy auth test ──────────────────────────────────────────
+  # Requires a UAS to answer the authenticated INVITE.
+  # Uses invite_uas.xml as the backend.
+
+  sipp-invite-auth-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.31
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/invite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - auth
+
+  sipp-invite-auth:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+      sipp-invite-auth-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.32
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/invite_auth.xml
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - auth
+
+  # ── Max-Forwards enforcement test ─────────────────────────────────────────
+  # Sends INVITE with Max-Forwards: 0, expects 483 Too Many Hops.
+  # Verifies RFC 3261 §16.3 enforcement at the dispatcher level (no UAS needed).
+
+  sipp-max-forwards:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.33
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/max_forwards_uac.xml
+      - -m
+      - "5"
+      - -l
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+
+  # ── RTPEngine proxy test ──────────────────────────────────────────────────
+  # Tests media anchoring through a mock RTPEngine via proxy script.
+  # Requires the "rtpengine" profile.
+  #
+  # Flow: UAC → siphon proxy (rtpengine.offer) → UAS
+  #       UAS 200 OK → siphon proxy (rtpengine.answer) → UAC
+  # Both SDP bodies are verified to contain the mock RTPEngine IP.
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile rtpengine \
+  #     up --abort-on-container-exit sipp-rtpengine-uac sipp-rtpengine-uas
+
+  # Mock RTPEngine — Python script simulating NG protocol on UDP 22222
+  mock-rtpengine:
+    image: python:3.12-slim
+    container_name: mock-rtpengine
+    volumes:
+      - ./rtpengine:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_rtpengine.py"]
+    environment:
+      RTPENGINE_PORT: "22222"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.40
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'hc d7:command4:pinge', ('127.0.0.1',22222)); d=s.recv(1024); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - rtpengine
+
+  # SIPhon proxy with RTPEngine config
+  siphon-rtpengine:
+    build:
+      context: ..
+    container_name: siphon-rtpengine-test
+    depends_on:
+      mock-rtpengine:
+        condition: service_healthy
+    volumes:
+      - ./rtpengine/siphon-rtpengine.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.41
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - rtpengine
+
+  # Register bob from the UAS IP so proxy knows where to relay
+  sipp-rtpengine-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpengine:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.42
+    entrypoint:
+      - sipp
+      - "172.20.0.41:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - rtpengine
+
+  # B-leg UAS: receives INVITE relayed by proxy with RTPEngine-rewritten SDP
+  sipp-rtpengine-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtpengine-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.42
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpengine
+
+  # A-leg UAC: sends INVITE to proxy with SDP, expects RTPEngine-rewritten 200 OK
+  sipp-rtpengine-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpengine:
+        condition: service_healthy
+      sipp-rtpengine-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.43
+    entrypoint:
+      - sipp
+      - "172.20.0.41:5060"
+      - -sf
+      - /sipp/scenarios/rtpengine_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpengine
+
+  # ── RTPEngine re-INVITE test (hold/resume) ────────────────────────────────
+  # Tests mid-dialog re-INVITE with RTPEngine offer/answer cycle.
+  # Flow: INVITE → 200 → ACK → re-INVITE(hold) → 200 → ACK
+  #                           → re-INVITE(resume) → 200 → ACK → BYE → 200
+
+  sipp-reinvite-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtpengine-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.42
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/reinvite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - reinvite
+
+  sipp-reinvite-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpengine:
+        condition: service_healthy
+      sipp-reinvite-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.43
+    entrypoint:
+      - sipp
+      - "172.20.0.41:5060"
+      - -sf
+      - /sipp/scenarios/reinvite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - reinvite
+
+  # ── B2BUA tests ──────────────────────────────────────────────────────────
+  # Tests the B2BUA with basic call, session timers, CANCEL, and failure.
+  # Uses a separate siphon instance with B2BUA config.
+  #
+  # IP assignments:
+  #   172.20.0.50 — siphon-b2bua
+  #   172.20.0.51 — registration helper
+  #   172.20.0.52 — B-leg UAS (basic + session timer)
+  #   172.20.0.53 — A-leg UAC
+  #   172.20.0.54 — B-leg UAS (failure)
+  #   172.20.0.55 — A-leg UAC (failure)
+  #   172.20.0.56 — B-leg UAS (cancel)
+  #   172.20.0.57 — A-leg UAC (cancel)
+
+  siphon-b2bua:
+    build:
+      context: ..
+    container_name: siphon-b2bua-test
+    volumes:
+      - ./configs/siphon.b2bua-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.50
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua
+      - b2bua-session-timer
+      - b2bua-failure
+      - b2bua-reinvite
+      - b2bua-reinvite-bleg
+      - b2bua-reinvite-reject
+      - b2bua-reinvite-breject
+      - b2bua-update
+      - b2bua-cancel
+      - b2bua-early-media
+      - b2bua-topology
+
+  # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
+  sipp-b2bua-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.51
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua
+      - b2bua-session-timer
+      - b2bua-reinvite
+      - b2bua-reinvite-bleg
+      - b2bua-reinvite-reject
+      - b2bua-reinvite-breject
+      - b2bua-update
+      - b2bua-cancel
+      - b2bua-early-media
+      - b2bua-topology
+
+  # --- B2BUA basic call test ---
+
+  sipp-b2bua-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua
+
+  sipp-b2bua-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua
+
+  # --- B2BUA early media test (183 with SDP) ---
+
+  sipp-b2bua-early-media-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_media_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-early-media
+
+  sipp-b2bua-early-media-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-early-media-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_media_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-early-media
+
+  # --- B2BUA reliable-provisional interworking test ---
+  # B-leg answers with a reliable 183 (Require: 100rel, RSeq); the A-leg never
+  # advertised 100rel.  siphon must auto-PRACK the B-leg and strip the 100rel
+  # contract from the 183 forwarded to the A-leg (else a real trunk CANCELs).
+  #
+  # Runs against a DEDICATED siphon instance pinned to `sip-trunk-edge@2026`
+  # (the BGCF/trunk-edge policy whose response default is Copy — it does NOT
+  # strip Require/RSeq).  This proves the strip is framework-auto, not a
+  # side effect of the default transparent-b2bua@2026 preset.
+  #
+  #   172.20.0.58 — siphon-b2bua-trunk-edge
+  #   172.20.0.59 — registration helper
+  #   172.20.0.52 — B-leg UAS (reliable 183)
+  #   172.20.0.53 — A-leg UAC (non-100rel trunk)
+
+  siphon-b2bua-trunk-edge:
+    build:
+      context: ..
+    container_name: siphon-b2bua-trunk-edge-test
+    volumes:
+      - ./configs/siphon.b2bua-trunk-edge-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.58
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-trunk-edge-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.59
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-reliable-prov-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-trunk-edge-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reliable_prov_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-reliable-prov-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+      sipp-b2bua-reliable-prov-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reliable_prov_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
+  # --- B2BUA session timer test ---
+
+  sipp-b2bua-st-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_session_timer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-session-timer
+
+  sipp-b2bua-st-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-st-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_session_timer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-session-timer
+
+  # --- B2BUA UPDATE test (RFC 3311 in-dialog UPDATE bridging) ---
+
+  sipp-b2bua-update-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_update_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-update
+
+  sipp-b2bua-update-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-update-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_update_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-update
+
+  # --- B2BUA failure test ---
+
+  # Deregister bob (clear contacts from previous tests)
+  sipp-b2bua-deregister-bob:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.51
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/deregister.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-failure
+
+  # Register bob pointing to failure UAS (172.20.0.54)
+  # Uses a different IP than deregister-bob to avoid server transaction
+  # branch collisions (SIPp PID-based branches can collide on same IP).
+  sipp-b2bua-register-failure:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-deregister-bob:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.56
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact_failure.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-failure
+
+  sipp-b2bua-failure-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register-failure:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.54
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_failure_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-failure
+
+  sipp-b2bua-failure-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-register-failure:
+        condition: service_completed_successfully
+      sipp-b2bua-failure-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.55
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_failure_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-failure
+
+  # --- B2BUA re-INVITE test (hold/resume) ---
+
+  sipp-b2bua-reinvite-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite
+
+  sipp-b2bua-reinvite-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite
+
+  # --- B2BUA B-leg-initiated re-INVITE test ---
+  # Tests that B2BUA correctly forwards re-INVITEs initiated by the B-leg (UAS)
+  # with correct Via branch. Targets Via branch bug.
+
+  sipp-b2bua-reinvite-bleg-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_bleg_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-bleg
+
+  sipp-b2bua-reinvite-bleg-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-bleg-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_bleg_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-bleg
+
+  # --- B2BUA re-INVITE rejected by B-leg test ---
+  # Tests that B2BUA ACKs non-2xx (488) re-INVITE responses from B-leg.
+  # Call must survive after rejected re-INVITE.
+
+  sipp-b2bua-reinvite-reject-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_reject_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-reject
+
+  sipp-b2bua-reinvite-reject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-reject-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_reject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-reject
+
+  # --- B2BUA B-leg re-INVITE rejected by A-leg test ---
+  # Tests both Via branch correctness AND non-2xx ACK from B-leg direction.
+  # B-leg UAS initiates re-INVITE, A-leg UAC rejects with 488.
+
+  sipp-b2bua-reinvite-breject-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_breject_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-breject
+
+  sipp-b2bua-reinvite-breject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-reinvite-breject-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_reinvite_breject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reinvite-breject
+
+  # --- B2BUA topology hiding test ---
+  # Validates CSeq regeneration, Max-Forwards decrement, From URI host rewrite,
+  # SDP o= sanitization, and PAI host rewrite across B2BUA boundary.
+
+  sipp-b2bua-topology-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_topology_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - b2bua-topology
+
+  sipp-b2bua-topology-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-topology-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_topology_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - b2bua-topology
+
+  # --- B2BUA CANCEL test ---
+
+  sipp-b2bua-cancel-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_cancel_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-cancel
+
+  sipp-b2bua-cancel-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-cancel-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_cancel_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-cancel
+
+  # ── IPsec VoLTE test ──────────────────────────────────────────────────────
+  # Tests IMS REGISTER with AKA authentication and IPsec SA negotiation.
+  #
+  # IP assignments:
+  #   172.20.0.35 — siphon-ipsec (P-CSCF with IPsec + AKA config)
+  #   172.20.0.30 — sipp-ipsec (UE simulator with carstenbock/sipp_ipsec)
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile ipsec build
+  #   docker compose -f sipp/docker-compose.yaml --profile ipsec \
+  #     up --abort-on-container-exit sipp-ipsec
+
+  siphon-ipsec:
+    build:
+      context: ..
+    container_name: siphon-ipsec-test
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./ipsec/siphon-pcscf.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.35
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:ims.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@ims.test>;tag=hc\\r\\nTo: <sip:ims.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - ipsec
+
+  sipp-ipsec:
+    build:
+      context: ./ipsec
+      dockerfile: Dockerfile
+    depends_on:
+      siphon-ipsec:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./ipsec:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.30
+    entrypoint:
+      - sipp
+      - "172.20.0.35:5060"
+      - -sf
+      - /sipp/scenarios/volte_register.xml
+      - -ipsec
+      - -ipsec_aalg
+      - hmac-sha-1-96
+      - -ipsec_ealg
+      - "null"
+      - -s
+      - "001010000000001"
+      - -key
+      - domain
+      - ims.test
+      - -key
+      - aka_K
+      - "0x0396eb317b6d1c36f19c1c84cd6ffd16"
+      - -key
+      - aka_OP
+      - "0xff9bb4d0b607f35029a9384c2e7eb8a3"
+      - -key
+      - aka_AMF
+      - "0x2175"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - ipsec
+
+# ── Gateway routing test (proxy mode) ──────────────────────────────────────
+  # Tests that gateway.select("gateways") routes an INVITE to the UAS.
+  # No registration needed — the gateway provides the destination directly.
+  #
+  # IP assignments:
+  #   172.20.0.60 — siphon-gateway (proxy with gateway config)
+  #   172.20.0.61 — SIPp UAS (gateway destination)
+  #   172.20.0.62 — SIPp UAC (caller)
+
+  siphon-gateway:
+    build:
+      context: ..
+    container_name: siphon-gateway-test
+    volumes:
+      - ./configs/siphon.gateway-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.60
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - gateway
+
+  sipp-gateway-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-gateway:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.61
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/invite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - gateway
+
+  sipp-gateway-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-gateway:
+        condition: service_healthy
+      sipp-gateway-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.62
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/invite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - gateway
+
+  # ── Gateway routing test (B2BUA mode) ────────────────────────────────────
+  # Tests that B2BUA on_invite uses gateway.select("gateways") for the B-leg.
+  #
+  # IP assignments:
+  #   172.20.0.65 — siphon-b2bua-gateway (B2BUA with gateway config)
+  #   172.20.0.66 — SIPp UAS (B-leg destination)
+  #   172.20.0.67 — SIPp UAC (A-leg caller)
+
+  siphon-b2bua-gateway:
+    build:
+      context: ..
+    container_name: siphon-b2bua-gateway-test
+    volumes:
+      - ./configs/siphon.b2bua-gateway-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.65
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-gateway
+
+  sipp-b2bua-gateway-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-gateway:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.66
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-gateway
+
+  sipp-b2bua-gateway-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-gateway:
+        condition: service_healthy
+      sipp-b2bua-gateway-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.67
+    entrypoint:
+      - sipp
+      - "172.20.0.65:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-gateway
+
+  # ── IMS E2E test (MOC/MTC call through S-CSCF) ──────────────────────────
+  # Full IMS call flow with standard digest auth:
+  #   1. Register alice and bob
+  #   2. alice INVITEs bob through S-CSCF
+  #   3. bob answers, call is up
+  #   4. alice sends BYE
+  #
+  # IP assignments:
+  #   172.20.0.70 — siphon-ims (combined P-CSCF + S-CSCF)
+  #   172.20.0.72 — bob UAS / registration
+  #   172.20.0.73 — alice UAC
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile ims build
+  #   docker compose -f sipp/docker-compose.yaml --profile ims \
+  #     up --abort-on-container-exit sipp-ims-uac
+
+  siphon-ims:
+    build:
+      context: ..
+    container_name: siphon-ims-test
+    volumes:
+      - ./ims/scscf-lab.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.70
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:ims.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@ims.test>;tag=hc\\r\\nTo: <sip:ims.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',6060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - ims
+
+  # Register bob with Contact pointing to 172.20.0.72:5060 (the UAS IP)
+  sipp-ims-register-bob:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-ims:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.72
+    entrypoint:
+      - sipp
+      - "172.20.0.70:6060"
+      - -sf
+      - /sipp/scenarios/ims/register_ims.xml
+      - -inf
+      - /sipp/scenarios/ims/bob_contact.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -key
+      - domain
+      - ims.test
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - ims
+
+  # Register alice from UAC IP with Contact pointing to 172.20.0.73:5060
+  sipp-ims-register-alice:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-ims-register-bob:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.73
+    entrypoint:
+      - sipp
+      - "172.20.0.70:6060"
+      - -sf
+      - /sipp/scenarios/ims/register_ims.xml
+      - -inf
+      - /sipp/scenarios/ims/alice_contact.csv
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -key
+      - domain
+      - ims.test
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - ims
+
+  # Bob's UAS — receives INVITE, answers with 200 OK + SDP
+  sipp-ims-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-ims-register-bob:
+        condition: service_completed_successfully
+      sipp-ims-register-alice:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.72
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/ims/invite_ims_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - ims
+
+  # Alice's UAC — sends INVITE to bob through S-CSCF, then BYE
+  sipp-ims-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-ims:
+        condition: service_healthy
+      sipp-ims-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.73
+    entrypoint:
+      - sipp
+      - "172.20.0.70:6060"
+      - -sf
+      - /sipp/scenarios/ims/invite_ims_uac.xml
+      - -s
+      - bob
+      - -key
+      - domain
+      - ims.test
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - ims
+
+# ── Network ────────────────────────────────────────────────────────────────
+networks:
+  sipnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

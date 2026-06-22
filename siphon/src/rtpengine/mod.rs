@@ -1,0 +1,22 @@
+//! RTPEngine NG protocol client — media proxy integration.
+//!
+//! RTPEngine is a media relay that rewrites SDP to anchor RTP/SRTP/DTLS-SRTP
+//! streams through itself.  Communication uses the NG (next generation)
+//! protocol: bencode-encoded dictionaries over UDP, with a random cookie
+//! prefix for request/response correlation.
+//!
+//! This module is Rust-only (transport is never exposed to Python).
+//! Python scripts interact via `from siphon import rtpengine` or
+//! `call.media.anchor()`.
+
+pub mod bencode;
+pub mod client;
+pub mod error;
+pub mod events;
+pub mod profile;
+pub mod session;
+
+pub use client::{RtpEngineClient, RtpEngineSet};
+pub use error::RtpEngineError;
+pub use profile::{NgFlags, ProfileEntry, ProfileRegistry};
+pub use session::{MediaSession, MediaSessionStore};

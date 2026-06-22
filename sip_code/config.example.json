@@ -1,0 +1,15 @@
+{
+  "development": {
+    "common": {
+      "domain": "example.domain",
+      "publicIp": "127.0.0.1",
+      "bindIp": "127.0.0.1",
+      "wssPort": 8443,
+      "tlsCertPath": "/etc/letsencrypt/live/example.domain",
+      "rtpengineAddress": "127.0.0.1:22222",
+      "webrtcServiceHost": "127.0.0.1",
+      "providersPath": "/etc/siphon/repo/sip_code/providers.json",
+      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+    }
+  }
+}

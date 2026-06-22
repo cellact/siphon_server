@@ -1,0 +1,3863 @@
+//! YAML configuration — `siphon.yaml` deserialization via serde_yml.
+
+use indexmap::IndexMap;
+use regex::Regex;
+use serde::{Deserialize, Deserializer};
+use std::path::Path;
+use std::sync::LazyLock;
+use crate::error::{Result, SiphonError};
+
+// ---------------------------------------------------------------------------
+// Environment variable expansion — `${VAR}` and `${VAR:-default}`
+// ---------------------------------------------------------------------------
+
+static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("env var regex")
+});
+
+/// Expand `${VAR}` and `${VAR:-default}` patterns in a config string.
+///
+/// - `${VAR}` is replaced with the environment variable's value, or the empty
+///   string if unset/empty.
+/// - `${VAR:-fallback}` uses `fallback` when the variable is unset or empty.
+fn expand_env_vars(input: &str) -> String {
+    ENV_VAR_RE
+        .replace_all(input, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            match std::env::var(var_name) {
+                Ok(value) if !value.is_empty() => value,
+                _ => caps
+                    .get(2)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            }
+        })
+        .into_owned()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub listen: ListenConfig,
+    pub domain: DomainConfig,
+    #[serde(default)]
+    pub script: ScriptConfig,
+    #[serde(default)]
+    pub registrar: RegistrarConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+
+    // Optional top-level sections — all `None` when not present.
+    // Rust holds them as data; wiring into the runtime happens in later phases.
+
+    /// Public IP advertised in Via/Contact/SDP (e.g. EC2 public IP when binding 0.0.0.0).
+    pub advertised_address: Option<String>,
+
+    /// TLS certificate and key for the `listen.tls` listeners.
+    pub tls: Option<TlsServerConfig>,
+
+    /// Rate limiting, scanner UA blocking, trusted source CIDRs.
+    pub security: Option<SecurityConfig>,
+
+    /// NAT traversal: force_rport, Contact rewriting, keepalive OPTIONS.
+    pub nat: Option<NatConfig>,
+
+    /// SIP call tracing via HEP (Homer/captAgent).
+    pub tracing: Option<TracingConfig>,
+
+    /// Prometheus metrics endpoint.
+    pub metrics: Option<MetricsConfig>,
+
+    /// Server and User-Agent header values injected into responses.
+    pub server: Option<ServerIdentityConfig>,
+
+    /// SIP transaction layer timer overrides.
+    pub transaction: Option<TransactionConfig>,
+
+    /// Dialog state tracking backend.
+    pub dialog: Option<DialogConfig>,
+
+    /// Named cache connections available to Python scripts via `cache.fetch(name, key)`.
+    pub cache: Option<Vec<NamedCacheConfig>>,
+
+    /// Media proxy (RTPEngine) configuration.
+    pub media: Option<MediaConfig>,
+
+    /// Gateway dispatcher (named groups with load balancing + health probing).
+    pub gateway: Option<GatewayConfig>,
+
+    /// RFC 4028 session timers for B2BUA mode.
+    pub session_timer: Option<SessionTimerConfig>,
+
+    /// B2BUA-wide knobs (header policy, etc.).
+    #[serde(default)]
+    pub b2bua: B2buaConfig,
+
+    /// Call Detail Records — billing and accounting.
+    pub cdr: Option<CdrYamlConfig>,
+
+    /// Outbound registration (UAC registrant) — maintain REGISTER bindings to upstream.
+    pub registrant: Option<RegistrantYamlConfig>,
+
+    /// Lawful Intercept — ETSI X1/X2/X3 + SIPREC (RFC 7866).
+    pub lawful_intercept: Option<LawfulInterceptConfig>,
+
+    /// Diameter peer connections and application routing table.
+    pub diameter: Option<DiameterConfig>,
+
+    /// IPsec SA management for P-CSCF (3GPP TS 33.203).
+    pub ipsec: Option<IpsecConfig>,
+
+    /// STIR/SHAKEN caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074).
+    /// Drives the `stir` Python namespace (`stir.sign()` / `stir.verify()`).
+    pub stir: Option<StirConfig>,
+
+    /// Initial Filter Criteria (3GPP TS 29.228) — S-CSCF iFC evaluation.
+    pub isc: Option<IscConfig>,
+
+    /// 5G SBI client configuration (Npcf, Nchf).
+    pub sbi: Option<SbiYamlConfig>,
+
+    /// Session Recording Server (SRS) — receive SIPREC INVITEs and record calls.
+    pub srs: Option<SrsConfig>,
+
+    /// Generic SUBSCRIBE dialog state (``proxy.subscribe_state``).  When
+    /// ``cache`` references a configured named cache, dialogs are
+    /// persisted through it so they survive restarts and are visible to
+    /// other replicas.
+    pub subscribe_state: Option<SubscribeStateConfig>,
+
+    /// Rf offline-charging configuration (3GPP TS 32.299).  Drives
+    /// automatic ACR-START / ACR-INTERIM / ACR-STOP on B2BUA and proxy
+    /// call lifecycle events, plus ACR-EVENT for REGISTER.  When
+    /// ``None`` (default), Rf is fully off — scripts can still call
+    /// ``diameter.rf_acr_*`` manually as long as a Diameter peer is
+    /// connected.
+    pub rf: Option<RfConfig>,
+
+    /// Free-form per-extension configuration. Each entry's value is opaque
+    /// to siphon-core and is interpreted by the extension that owns the
+    /// name. A scalar string is conventionally treated as a path to a
+    /// further configuration file; any other YAML form (mapping, sequence,
+    /// number, bool) is passed through verbatim.
+    ///
+    /// ```yaml
+    /// extensions:
+    ///   foo: /etc/siphon/foo.yaml          # path form
+    ///   bar:                                # inline form
+    ///     listen: "0.0.0.0:8080"
+    ///     workers: 4
+    /// ```
+    ///
+    /// Extensions read their entry via [`Config::extension_path`] (when
+    /// they expect an external file) or [`Config::extension_config`]
+    /// (when they consume the value directly).
+    #[serde(default)]
+    pub extensions: Option<IndexMap<String, serde_yml::Value>>,
+}
+
+/// B2BUA-wide configuration knobs.
+///
+/// Currently surfaces the default header policy applied to B2BUA calls when
+/// the script doesn't pass `header_policy=` on `call.dial()`.  The built-in
+/// presets ship with siphon — operators just pin the qualified name (e.g.
+/// `"transparent-b2bua@2026"`).  An unset/empty value falls back to
+/// `transparent-b2bua@2026`, which reproduces siphon's pre-policy B2BUA
+/// behaviour (modulo the intentional `Proxy-Authenticate` strip).
+///
+/// ```yaml
+/// b2bua:
+///   default_header_policy: "ims-trust-domain-boundary@2026"
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct B2buaConfig {
+    /// Qualified preset name (`"<name>@<version>"`).  When `None`, falls
+    /// back to `"transparent-b2bua@2026"`.
+    pub default_header_policy: Option<String>,
+}
+
+/// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE
+/// dialog state with optional Redis-backed write-through.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubscribeStateConfig {
+    /// Name of a cache defined in the top-level ``cache:`` list that
+    /// should be used as L2 write-through storage.  When unset, the
+    /// store is in-process only (no cross-replica visibility).
+    pub cache: Option<String>,
+    /// Default expiry (seconds) when the SUBSCRIBE carries no
+    /// ``Expires`` header and the script doesn't override.  Defaults to
+    /// 3600.
+    #[serde(default = "default_subscribe_state_expires")]
+    pub default_expires_secs: u64,
+}
+
+fn default_subscribe_state_expires() -> u64 {
+    3600
+}
+
+// ---------------------------------------------------------------------------
+// DSCP / DiffServ — RFC 4594 signaling QoS
+// ---------------------------------------------------------------------------
+
+/// Parse a DSCP name (CS0–CS7, AF11–AF43, EF, BE) or a raw integer 0–63.
+pub fn parse_dscp(value: &str) -> std::result::Result<u8, String> {
+    match value.to_uppercase().as_str() {
+        "CS0" | "BE" => Ok(0),
+        "CS1" => Ok(8),
+        "AF11" => Ok(10),
+        "AF12" => Ok(12),
+        "AF13" => Ok(14),
+        "CS2" => Ok(16),
+        "AF21" => Ok(18),
+        "AF22" => Ok(20),
+        "AF23" => Ok(22),
+        "CS3" => Ok(24),
+        "AF31" => Ok(26),
+        "AF32" => Ok(28),
+        "AF33" => Ok(30),
+        "CS4" => Ok(32),
+        "AF41" => Ok(34),
+        "AF42" => Ok(36),
+        "AF43" => Ok(38),
+        "CS5" => Ok(40),
+        "EF" => Ok(46),
+        "CS6" => Ok(48),
+        "CS7" => Ok(56),
+        _ => value
+            .parse::<u8>()
+            .map_err(|_| format!("invalid DSCP value: {value}"))
+            .and_then(|v| {
+                if v <= 63 {
+                    Ok(v)
+                } else {
+                    Err(format!("DSCP must be 0-63, got {v}"))
+                }
+            }),
+    }
+}
+
+/// Convert a 6-bit DSCP value to the 8-bit TOS byte (RFC 2474 §3).
+pub fn dscp_to_tos(dscp: u8) -> u32 {
+    (dscp as u32) << 2
+}
+
+/// Default DSCP: CS3 (24) — RFC 4594 Signaling class for SIP.
+fn default_dscp() -> Option<u8> {
+    Some(24)
+}
+
+/// Serde deserializer accepting either a DSCP name string or a raw integer.
+fn deserialize_dscp<'de, D>(deserializer: D) -> std::result::Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DscpValue {
+        Int(u64),
+        Str(String),
+    }
+
+    let value: Option<DscpValue> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(DscpValue::Int(n)) => {
+            if n > 63 {
+                Err(de::Error::custom(format!("DSCP must be 0-63, got {n}")))
+            } else {
+                Ok(Some(n as u8))
+            }
+        }
+        Some(DscpValue::Str(s)) => parse_dscp(&s).map(Some).map_err(de::Error::custom),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport listeners
+// ---------------------------------------------------------------------------
+
+/// A listen entry: either a plain address string or a struct with an
+/// optional advertised address (like OpenSIPS `socket ... as ...`).
+///
+/// ```yaml
+/// listen:
+///   tcp:
+///     - "10.0.0.1:5060"                          # plain string
+///     - address: "10.0.0.1:5061"                  # struct form
+///       advertise: "sip.example.com"              #   with advertised host
+/// ```
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ListenEntry {
+    /// Plain address string (e.g. `"10.0.0.1:5060"`).
+    Plain(String),
+    /// Address with optional advertised host and per-listener DSCP override.
+    Extended {
+        address: String,
+        #[serde(default)]
+        advertise: Option<String>,
+        /// Per-listener DSCP override (0–63 or name like "CS3", "EF").
+        #[serde(default, deserialize_with = "deserialize_dscp")]
+        dscp: Option<u8>,
+    },
+}
+
+impl ListenEntry {
+    /// The bind address string.
+    pub fn address(&self) -> &str {
+        match self {
+            ListenEntry::Plain(addr) => addr,
+            ListenEntry::Extended { address, .. } => address,
+        }
+    }
+
+    /// The advertised host (if configured).
+    pub fn advertise(&self) -> Option<&str> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { advertise, .. } => advertise.as_deref(),
+        }
+    }
+
+    /// Per-listener DSCP override (if configured).
+    pub fn dscp(&self) -> Option<u8> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { dscp, .. } => *dscp,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ListenConfig {
+    /// Global DSCP value applied to all listeners (default: CS3 = 24).
+    /// Per-listener `dscp` in the extended form overrides this.
+    /// Set to `0` or `"BE"` to disable marking.
+    #[serde(default = "default_dscp", deserialize_with = "deserialize_dscp")]
+    pub dscp: Option<u8>,
+    #[serde(default)]
+    pub udp: Vec<ListenEntry>,
+    #[serde(default)]
+    pub tcp: Vec<ListenEntry>,
+    #[serde(default)]
+    pub tls: Vec<ListenEntry>,
+    /// WebSocket (ws://) — browser/WebRTC UEs.
+    #[serde(default)]
+    pub ws: Vec<ListenEntry>,
+    /// Secure WebSocket (wss://) — browser/WebRTC UEs.
+    #[serde(default)]
+    pub wss: Vec<ListenEntry>,
+    /// SCTP (RFC 4168) — used between IMS core nodes.
+    #[serde(default)]
+    pub sctp: Vec<ListenEntry>,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            dscp: default_dscp(),
+            udp: Vec::new(),
+            tcp: Vec::new(),
+            tls: Vec::new(),
+            ws: Vec::new(),
+            wss: Vec::new(),
+            sctp: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network identity
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DomainConfig {
+    pub local: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Script engine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScriptConfig {
+    #[serde(default = "default_script_path")]
+    pub path: String,
+    #[serde(default = "default_reload")]
+    pub reload: ReloadMode,
+    /// Size of the asyncio loop driver pool used to run async script
+    /// handlers.  Each driver is a dedicated OS thread running a Python
+    /// event loop forever — see `script::async_pool` for why this is
+    /// needed (orphaned `asyncio.create_task` survival).  Defaults to
+    /// the number of available CPUs (clamped to at least 1).
+    #[serde(default)]
+    pub async_pool_size: Option<usize>,
+    /// Size of the synchronous Python executor pool used to run *sync*
+    /// script-handler invocations.  Each worker is a fixed, never-reaped
+    /// OS thread with a persistent Python attach — see `script::py_executor`
+    /// for why this is needed (the free-threaded-CPython mimalloc heap leak
+    /// on the elastic `spawn_blocking` pool).  Defaults to 2× the number of
+    /// available CPUs (clamped to at least 2): the hot inbound path runs here,
+    /// and 2× restores the burst headroom the elastic pool gave at the
+    /// throughput ceiling.  Lower it on memory-constrained, low-traffic NFs.
+    #[serde(default)]
+    pub sync_pool_size: Option<usize>,
+}
+
+fn default_script_path() -> String {
+    String::new()
+}
+
+impl Default for ScriptConfig {
+    fn default() -> Self {
+        Self {
+            path: default_script_path(),
+            reload: default_reload(),
+            async_pool_size: None,
+            sync_pool_size: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReloadMode {
+    /// inotify watch — reload on file change, no restart required.
+    Auto,
+    /// Only reload on SIGHUP.
+    Sighup,
+}
+
+fn default_reload() -> ReloadMode {
+    ReloadMode::Auto
+}
+
+// ---------------------------------------------------------------------------
+// Registrar
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RegistrarConfig {
+    pub backend: RegistrarBackendType,
+    pub default_expires: u32,
+    pub max_expires: u32,
+    /// Floor on Expires: header value. Requests below this are rejected with 423.
+    pub min_expires: Option<u32>,
+    /// Maximum contacts per AoR (None = unlimited). Use 1 for single-device deployments.
+    pub max_contacts: Option<u32>,
+    pub redis: Option<RedisBackendConfig>,
+    pub postgres: Option<PostgresBackendConfig>,
+    /// Registration liveness — network-initiated deregistration when a UE
+    /// vanishes without a SIP de-REGISTER (flow failure on TCP/TLS, idle
+    /// IPsec SA on UDP).  Default off.
+    #[serde(default)]
+    pub liveness: RegistrarLivenessConfig,
+}
+
+impl Default for RegistrarConfig {
+    fn default() -> Self {
+        Self {
+            backend: RegistrarBackendType::Memory,
+            default_expires: 3600,
+            max_expires: 7200,
+            min_expires: None,
+            max_contacts: None,
+            redis: None,
+            postgres: None,
+            liveness: RegistrarLivenessConfig::default(),
+        }
+    }
+}
+
+/// Registration-liveness configuration (network-initiated deregistration).
+///
+/// When `enabled`, siphon clears a registration on its own initiative once it
+/// detects the UE is gone, instead of waiting for the SIP `Expires` timer
+/// (often hours):
+///   - **TCP/TLS/WS/WSS**: the binding is removed when its inbound connection
+///     closes (peer FIN/RST, read error, idle timeout, or CRLF-keepalive
+///     failure) — RFC 5626 §4.2.2 flow failure.
+///   - **UDP+IPsec**: an idle binding is detected by polling the kernel XFRM
+///     SA inbound use-time; the UE's RFC 6223 keepalive (~every 30 s) keeps
+///     the SA warm, so silence beyond `idle_multiplier × keepalive_interval`
+///     marks the binding suspect.  A single OPTIONS probe confirms before the
+///     binding is deregistered.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RegistrarLivenessConfig {
+    /// Master switch.  Default `false` until the feature is proven in the
+    /// field; with it off, siphon behaves exactly as before (Expires-only).
+    pub enabled: bool,
+    /// Negotiated UE keepalive cadence in seconds (RFC 6223 Flow-Timer / NAT
+    /// keepalive).  Used as the base unit for the UDP+IPsec idle window.
+    pub keepalive_interval_secs: u32,
+    /// Grace multiplier: a UDP+IPsec binding is suspect after
+    /// `idle_multiplier × keepalive_interval_secs` of SA silence.  Default 3
+    /// (~90 s against a 30 s keepalive) survives a brief radio blip or a
+    /// single dropped keepalive without false-deregistering a live UE.
+    pub idle_multiplier: u32,
+    /// Per-attempt timeout (milliseconds) for the one-shot OPTIONS liveness
+    /// probe sent to a suspect UDP+IPsec binding before deregistration.
+    pub probe_timeout_ms: u64,
+    /// What to do once a binding is declared dead.
+    pub dereg_mode: LivenessDeregMode,
+}
+
+impl Default for RegistrarLivenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keepalive_interval_secs: 30,
+            idle_multiplier: 3,
+            probe_timeout_ms: 2000,
+            dereg_mode: LivenessDeregMode::NetworkDereg,
+        }
+    }
+}
+
+/// How siphon clears a binding once liveness detection declares the UE dead.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessDeregMode {
+    /// Authoritative registrar (S-CSCF / single box): drop the binding locally
+    /// and emit the `@registrar.on_change` cascade.  P-CSCF cache: additionally
+    /// synthesize a de-REGISTER (`Expires: 0`) on the UE's behalf toward the
+    /// S-CSCF so the registrar of record also clears the binding.
+    NetworkDereg,
+    /// Drop local state only (binding + IPsec SA) and emit the local
+    /// `on_change` event; never synthesize an upstream de-REGISTER.  Use on a
+    /// box that is the registrar of record, where the reg-event NOTIFY already
+    /// propagates the teardown.
+    LocalOnly,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrarBackendType {
+    Memory,
+    Redis,
+    Postgres,
+    /// Custom backend via Python hooks: `@registrar.on_save` / `@registrar.on_lookup`.
+    Python,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RedisBackendConfig {
+    pub url: String,
+    /// Key prefix for all registrar entries (default: "siphon:reg:").
+    #[serde(default = "default_redis_key_prefix")]
+    pub key_prefix: String,
+    /// Extra seconds beyond `expires` to retain keys, to avoid race conditions.
+    #[serde(default = "default_ttl_slack")]
+    pub ttl_slack_secs: u32,
+}
+
+fn default_redis_key_prefix() -> String {
+    "siphon:reg:".to_owned()
+}
+
+fn default_ttl_slack() -> u32 {
+    30
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PostgresBackendConfig {
+    pub url: String,
+    #[serde(default = "default_postgres_table")]
+    pub table: String,
+}
+
+fn default_postgres_table() -> String {
+    "registrar".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AuthConfig {
+    #[serde(default = "default_realm")]
+    pub realm: String,
+    #[serde(default = "default_auth_backend")]
+    pub backend: AuthBackendType,
+    #[serde(default)]
+    pub users: std::collections::HashMap<String, String>,
+    /// AKA credentials for IMS authentication (Milenage key derivation).
+    /// Key is the IMPI (e.g. "001010000000001@ims.test").
+    #[serde(default)]
+    pub aka_credentials: std::collections::HashMap<String, AkaCredential>,
+    pub http: Option<HttpAuthConfig>,
+    pub diameter: Option<DiameterCxConfig>,
+}
+
+/// AKA credential for a single subscriber (3GPP TS 35.206 Milenage).
+#[derive(Debug, Deserialize, Clone)]
+pub struct AkaCredential {
+    /// Subscriber key K (32 hex chars = 16 bytes).
+    pub k: String,
+    /// Operator variant key OP (32 hex chars = 16 bytes).
+    pub op: String,
+    /// Authentication Management Field AMF (4 hex chars = 2 bytes).
+    #[serde(default = "default_amf")]
+    pub amf: String,
+}
+
+fn default_amf() -> String {
+    "8000".to_string()
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            realm: default_realm(),
+            backend: default_auth_backend(),
+            users: Default::default(),
+            aka_credentials: Default::default(),
+            http: None,
+            diameter: None,
+        }
+    }
+}
+
+/// Diameter Cx connection to an HSS for IMS authentication (MAR/MAA, SAR/SAA).
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiameterCxConfig {
+    /// HSS hostname or IP address.
+    pub host: String,
+    /// HSS Diameter port (default: 3868).
+    #[serde(default = "default_diameter_port")]
+    pub port: u16,
+    /// Origin-Host identity for this SIPhon node.
+    pub origin_host: String,
+    /// Origin-Realm for this SIPhon node.
+    pub origin_realm: String,
+    /// Destination-Realm (HSS realm).
+    pub destination_realm: String,
+    /// Destination-Host (optional, for targeted routing).
+    pub destination_host: Option<String>,
+    /// Transport protocol: "tcp" (default) or "sctp".
+    #[serde(default = "default_diameter_transport")]
+    pub transport: String,
+    /// Watchdog (DWR) interval in seconds.
+    #[serde(default = "default_watchdog_interval")]
+    pub watchdog_interval: u64,
+    /// Reconnect delay in seconds after connection failure.
+    #[serde(default = "default_reconnect_delay")]
+    pub reconnect_delay: u64,
+}
+
+fn default_diameter_port() -> u16 { 3868 }
+fn default_diameter_transport() -> String { "tcp".to_string() }
+fn default_watchdog_interval() -> u64 { 30 }
+fn default_reconnect_delay() -> u64 { 5 }
+fn default_diameter_route_algorithm() -> String { "failover".to_string() }
+
+// ---------------------------------------------------------------------------
+// Diameter peer + routing table (top-level `diameter:` section)
+// ---------------------------------------------------------------------------
+
+/// Top-level Diameter configuration with named peers and application routing.
+///
+/// SIPhon acts as a Diameter client — it connects outbound to peers (HSS, OCS,
+/// PCRF, CDF) and uses the routing table to decide which peer(s) to use for
+/// each application interface.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiameterConfig {
+    /// Origin-Host identity for this SIPhon node (used in all CER messages).
+    pub origin_host: String,
+    /// Origin-Realm for this SIPhon node.
+    pub origin_realm: String,
+    /// Product-Name advertised in CER/CEA. When unset, falls back to the
+    /// product name resolved by `SiphonServer::product()` (default "SIPhon").
+    #[serde(default)]
+    pub product_name: Option<String>,
+    /// Default transport for all peers: "tcp" (default) or "sctp".
+    #[serde(default = "default_diameter_transport")]
+    pub transport: String,
+    /// Default DWR/DWA watchdog interval in seconds for all peers.
+    #[serde(default = "default_watchdog_interval")]
+    pub watchdog_interval: u64,
+    /// Default reconnect delay in seconds after connection failure.
+    #[serde(default = "default_reconnect_delay")]
+    pub reconnect_delay: u64,
+    /// Named Diameter peers (HSS, OCS, PCRF, CDF, etc.).
+    #[serde(default)]
+    pub peers: Vec<DiameterPeerEntry>,
+    /// Application → peer routing table.
+    #[serde(default)]
+    pub routes: Vec<DiameterRouteEntry>,
+}
+
+/// A named Diameter peer endpoint.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiameterPeerEntry {
+    /// Unique name for this peer (referenced in routes).
+    pub name: String,
+    /// Peer hostname or IP address.
+    pub host: String,
+    /// Peer Diameter port (default: 3868).
+    #[serde(default = "default_diameter_port")]
+    pub port: u16,
+    /// Destination-Realm for this peer.
+    pub destination_realm: String,
+    /// Destination-Host (optional, for targeted routing).
+    pub destination_host: Option<String>,
+    /// Transport override: "tcp" or "sctp" (inherits parent default if absent).
+    pub transport: Option<String>,
+    /// Watchdog interval override in seconds.
+    pub watchdog_interval: Option<u64>,
+    /// Reconnect delay override in seconds.
+    pub reconnect_delay: Option<u64>,
+}
+
+/// Maps a Diameter application to one or more peers.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiameterRouteEntry {
+    /// Which Diameter application this route serves.
+    pub application: DiameterApplication,
+    /// Optional realm filter — only match requests for this destination realm.
+    pub realm: Option<String>,
+    /// Peer names in priority order.
+    pub peers: Vec<String>,
+    /// Selection algorithm: "failover" (default) or "round_robin".
+    #[serde(default = "default_diameter_route_algorithm")]
+    pub algorithm: String,
+}
+
+/// Supported Diameter application identifiers.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiameterApplication {
+    Cx,
+    Sh,
+    Ro,
+    Rf,
+    Rx,
+    /// S6c (TS 29.336) — SMSC ↔ HSS for SMS-over-Diameter.
+    S6c,
+    /// SGd (TS 29.338) — SMSC ↔ MME/SGSN for SMS-over-NAS delivery.
+    Sgd,
+}
+
+impl DiameterApplication {
+    /// Map to (vendor_id, auth_application_id) tuple for CER/CEA.
+    pub fn to_app_id(&self) -> (u32, u32) {
+        use crate::diameter::dictionary;
+        match self {
+            Self::Cx => (dictionary::VENDOR_3GPP, dictionary::CX_APP_ID),
+            Self::Sh => (dictionary::VENDOR_3GPP, dictionary::SH_APP_ID),
+            Self::Rx => (dictionary::VENDOR_3GPP, dictionary::RX_APP_ID),
+            Self::Ro => (0, dictionary::RO_APP_ID),
+            Self::Rf => (0, dictionary::RF_APP_ID),
+            Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),
+            Self::Sgd => (dictionary::VENDOR_3GPP, dictionary::SGD_APP_ID),
+        }
+    }
+}
+
+impl DiameterConfig {
+    /// Look up the ordered peer entries for an application, optionally filtered by realm.
+    pub fn peers_for_application(
+        &self,
+        application: &DiameterApplication,
+        realm: Option<&str>,
+    ) -> Vec<&DiameterPeerEntry> {
+        for route in &self.routes {
+            if &route.application != application {
+                continue;
+            }
+            if let Some(ref route_realm) = route.realm {
+                if let Some(requested_realm) = realm {
+                    if route_realm != requested_realm {
+                        continue;
+                    }
+                }
+            }
+            return route
+                .peers
+                .iter()
+                .filter_map(|name| self.peers.iter().find(|p| &p.name == name))
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Build a `PeerConfig` for a specific peer entry.
+    ///
+    /// Application IDs are collected from all routes that reference this peer,
+    /// so a single peer connection can advertise support for multiple interfaces
+    /// (e.g., Cx + Sh on the same HSS).
+    ///
+    /// `product_name` and `product_version` are the values resolved by
+    /// `SiphonServer::product()` — they back the Product-Name and
+    /// Firmware-Revision AVPs when the YAML `diameter.product_name`
+    /// override is unset.
+    pub fn to_peer_config(
+        &self,
+        peer: &DiameterPeerEntry,
+        product_name: &str,
+        product_version: &str,
+    ) -> crate::diameter::peer::PeerConfig {
+        let application_ids: Vec<(u32, u32)> = self
+            .routes
+            .iter()
+            .filter(|r| r.peers.contains(&peer.name))
+            .map(|r| r.application.to_app_id())
+            .collect();
+
+        crate::diameter::peer::PeerConfig {
+            host: peer.host.clone(),
+            port: peer.port,
+            origin_host: self.origin_host.clone(),
+            origin_realm: self.origin_realm.clone(),
+            destination_host: peer.destination_host.clone(),
+            destination_realm: peer.destination_realm.clone(),
+            local_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            application_ids,
+            watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
+            reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
+            product_name: self.product_name.clone()
+                .unwrap_or_else(|| product_name.to_string()),
+            firmware_revision: crate::diameter::peer::version_to_firmware_revision(
+                product_version,
+            ),
+        }
+    }
+}
+
+fn default_realm() -> String {
+    "localhost".to_owned()
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthBackendType {
+    /// Credentials defined inline under `auth.users`.
+    Static,
+    /// PostgreSQL / generic DB (planned).
+    Database,
+    /// REST lookup — GET `{url}` where `{username}` is substituted.
+    /// Response body is either a plaintext password or a pre-hashed HA1.
+    Http,
+    /// Diameter Cx MAR → HSS (IMS S-CSCF, planned).
+    DiameterCx,
+}
+
+fn default_auth_backend() -> AuthBackendType {
+    AuthBackendType::Static
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpAuthConfig {
+    /// URL template. `{username}` is replaced at runtime.
+    /// Example: `http://127.0.0.1:8000/sip/auth/{username}`
+    pub url: String,
+    #[serde(default = "default_http_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_http_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// If true, the HTTP response body is a pre-hashed HA1 hex string.
+    /// If false, it is a plaintext password (SIPhon hashes it internally).
+    #[serde(default)]
+    pub ha1: bool,
+}
+
+fn default_http_timeout_ms() -> u64 {
+    2000
+}
+fn default_http_connect_timeout_ms() -> u64 {
+    500
+}
+
+// ---------------------------------------------------------------------------
+// TLS server config (certificates — listeners are under `listen.tls`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsServerConfig {
+    pub certificate: String,
+    pub private_key: String,
+    #[serde(default = "default_tls_method")]
+    pub method: String,
+    /// If true, client certificates are required and verified.
+    #[serde(default)]
+    pub verify_client: bool,
+}
+
+fn default_tls_method() -> String {
+    "TLSv1_3".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Security
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SecurityConfig {
+    pub rate_limit: Option<RateLimitConfig>,
+    pub scanner_block: Option<ScannerBlockConfig>,
+    /// Source IPs/CIDRs that bypass rate limiting (e.g. internal AS, monitoring).
+    #[serde(default)]
+    pub trusted_cidrs: Vec<String>,
+    /// Block source IP after N consecutive failed authentication attempts.
+    pub failed_auth_ban: Option<FailedAuthBanConfig>,
+    /// APIBAN community blocklist integration.
+    pub apiban: Option<ApiBanConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiBanConfig {
+    /// API key from apiban.org.
+    pub api_key: String,
+    /// Poll interval in seconds (default: 300).
+    #[serde(default = "default_apiban_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_apiban_interval_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    pub window_secs: u32,
+    pub max_requests: u32,
+    #[serde(default = "default_ban_duration_secs")]
+    pub ban_duration_secs: u32,
+}
+
+fn default_ban_duration_secs() -> u32 {
+    3600
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScannerBlockConfig {
+    #[serde(default)]
+    pub user_agents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FailedAuthBanConfig {
+    pub threshold: u32,
+    pub ban_duration_secs: u32,
+}
+
+// ---------------------------------------------------------------------------
+// NAT traversal
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NatConfig {
+    /// Always rewrite received port in Via/Contact from source port.
+    #[serde(default)]
+    pub force_rport: bool,
+    /// Rewrite Contact URI host:port with observed source address.
+    #[serde(default)]
+    pub fix_contact: bool,
+    /// Rewrite Contact on REGISTER with observed source address.
+    #[serde(default)]
+    pub fix_register: bool,
+    /// Send periodic OPTIONS keep-alives to maintain NAT pinholes.
+    pub keepalive: Option<NatKeepaliveConfig>,
+    /// RFC 5626 §4.4.1 CRLF keep-alive for persistent connections (TCP/TLS).
+    pub crlf_keepalive: Option<CrlfKeepaliveConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NatKeepaliveConfig {
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Interval between OPTIONS pings (seconds).
+    #[serde(default = "default_keepalive_interval")]
+    pub interval_secs: u32,
+    /// Deregister contact after this many consecutive failed pings.
+    #[serde(default = "default_keepalive_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+fn bool_true() -> bool {
+    true
+}
+fn default_keepalive_interval() -> u32 {
+    30
+}
+fn default_keepalive_failure_threshold() -> u32 {
+    10
+}
+
+/// RFC 5626 §4.4.1 CRLF keepalive for connection-oriented transports.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CrlfKeepaliveConfig {
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Interval between CRLF pings (seconds).  RFC 5626 recommends 20-30s.
+    #[serde(default = "default_crlf_keepalive_interval")]
+    pub interval_secs: u32,
+    /// Close connection after this many consecutive missed pongs.
+    #[serde(default = "default_crlf_keepalive_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+fn default_crlf_keepalive_interval() -> u32 {
+    30
+}
+
+fn default_crlf_keepalive_failure_threshold() -> u32 {
+    3
+}
+
+// ---------------------------------------------------------------------------
+// SIP tracing via HEP (Homer / captAgent)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TracingConfig {
+    pub hep: Option<HepConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HepConfig {
+    /// Endpoint of the captAgent/Homer collector (e.g. "127.0.0.1:9060").
+    pub endpoint: String,
+    #[serde(default = "default_hep_version")]
+    pub version: u8,
+    #[serde(default = "default_hep_transport")]
+    pub transport: HepTransport,
+    /// Label shown in Homer for this agent — use different values per node type.
+    pub agent_id: Option<String>,
+    /// CA certificate file for TLS transport (PEM format).
+    /// When omitted with TLS transport, the system root CAs are used.
+    pub ca_cert: Option<String>,
+    /// Server name for TLS SNI. Defaults to the hostname from `endpoint`.
+    pub tls_server_name: Option<String>,
+    /// Minimum interval (in seconds) between repeated error log messages.
+    /// Prevents log flooding when the collector is unreachable. Default: 30.
+    #[serde(default = "default_hep_error_log_interval")]
+    pub error_log_interval: u64,
+}
+
+fn default_hep_error_log_interval() -> u64 {
+    30
+}
+
+fn default_hep_version() -> u8 {
+    3
+}
+
+fn default_hep_transport() -> HepTransport {
+    HepTransport::Udp
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum HepTransport {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetricsConfig {
+    pub prometheus: Option<PrometheusConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PrometheusConfig {
+    /// Address to expose the /metrics endpoint on (e.g. "0.0.0.0:8888").
+    pub listen: String,
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Server identity headers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerIdentityConfig {
+    pub server_header: Option<String>,
+    pub user_agent_header: Option<String>,
+    /// Graceful drain on SIGTERM/SIGINT: stop accepting new INVITEs and wait
+    /// up to this many seconds for in-flight transactions and B2BUA calls to
+    /// finish before exiting. Default: 30s. Set to 0 to disable drain (exit
+    /// immediately on signal).
+    #[serde(default = "default_drain_secs")]
+    pub drain_secs: u64,
+    /// Stable per-replica identity, stamped onto every accepted REGISTER
+    /// binding so scripts can recognise their own bindings after restart.
+    /// Recommended: ``"${POD_NAME:-${HOSTNAME}}"`` for K8s StatefulSet
+    /// deployments.  When unset, siphon falls back to the ``HOSTNAME``
+    /// environment variable, then to ``"siphon"`` as a last resort.
+    pub instance_id: Option<String>,
+}
+
+fn default_drain_secs() -> u64 {
+    30
+}
+
+// ---------------------------------------------------------------------------
+// Transaction layer timers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TransactionConfig {
+    /// Non-INVITE transaction timeout (fr_timeout). Default: 5s.
+    #[serde(default = "default_tx_timeout")]
+    pub timeout_secs: u32,
+    /// INVITE transaction timeout (fr_inv_timeout). Default: 30s.
+    #[serde(default = "default_tx_invite_timeout")]
+    pub invite_timeout_secs: u32,
+    /// Auto-emit `100 Trying` on slow non-INVITE server transactions to
+    /// suppress UAC retransmits (RFC 3261 §17.1.2). Mirror of §17.2.1 for
+    /// INVITE applied to MESSAGE/SUBSCRIBE/OPTIONS relays. Default: true.
+    #[serde(default = "default_auto_emit_100_trying")]
+    pub auto_emit_100_trying: bool,
+    /// Delay before the auto-100 Trying fires. Default: 200ms (mirrors
+    /// RFC 3261 §17.2.1's 200 ms IST timer).
+    #[serde(default = "default_auto_emit_100_trying_delay_ms")]
+    pub auto_emit_100_trying_delay_ms: u64,
+}
+
+fn default_tx_timeout() -> u32 {
+    5
+}
+fn default_tx_invite_timeout() -> u32 {
+    30
+}
+fn default_auto_emit_100_trying() -> bool {
+    true
+}
+fn default_auto_emit_100_trying_delay_ms() -> u64 {
+    200
+}
+
+// ---------------------------------------------------------------------------
+// Dialog tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DialogConfig {
+    #[serde(default = "default_dialog_backend")]
+    pub backend: DialogBackendType,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DialogBackendType {
+    Memory,
+    Redis,
+    Postgres,
+}
+
+fn default_dialog_backend() -> DialogBackendType {
+    DialogBackendType::Memory
+}
+
+// ---------------------------------------------------------------------------
+// Named cache connections (accessible from Python scripts via cache.fetch)
+// ---------------------------------------------------------------------------
+
+/// A named cache backend available to Python scripts.
+///
+/// In the script: `from siphon import cache` then `await cache.fetch("myconn", key)`.
+///
+/// Example siphon.yaml:
+/// ```yaml
+/// cache:
+///   - name: "cnam"
+///     url: "redis://172.16.0.252:6379"
+///     local_ttl_secs: 60
+///     local_max_entries: 10000
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct NamedCacheConfig {
+    /// Identifier used in `cache.fetch(name, key)` calls.
+    pub name: String,
+    /// Redis URL (currently the only supported backend).
+    pub url: String,
+    /// If set, a local LRU cache is maintained in front of Redis.
+    pub local_ttl_secs: Option<u64>,
+    pub local_max_entries: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Media (RTPEngine)
+// ---------------------------------------------------------------------------
+
+/// Media proxy configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MediaConfig {
+    /// RTPEngine instance(s). A single instance or a list for load-balancing / HA.
+    pub rtpengine: RtpEngineSetConfig,
+    /// Custom media profiles (name → offer/answer NG flags).
+    /// Built-in profiles (srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough)
+    /// are always available; custom entries here extend or override them.
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, MediaProfileConfig>,
+    /// Name used in SDP `o=` and `s=` lines when sanitizing relayed SDP.
+    /// Hides the remote endpoint's identity (e.g. "FreeSWITCH") from the other leg.
+    /// Defaults to "SIPhon" if not set.
+    pub sdp_name: Option<String>,
+    /// Optional inbound event listener for rtpengine async notifications
+    /// (DTMF, etc.).  Configure rtpengine with `dtmf-log-ng-tcp-uri=tcp://<this>`
+    /// to make it deliver bencode-framed events here.
+    pub events: Option<RtpEngineEventsConfig>,
+    /// Interval in seconds between rtpengine NG `ping` health probes.
+    /// The result is published as `siphon_rtpengine_instances_up` (count of
+    /// healthy instances) and `siphon_rtpengine_instance_up{address}` (per
+    /// instance 0/1).  Set to `0` to disable probing entirely.
+    /// Default: 5.
+    #[serde(default = "default_rtpengine_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+}
+
+fn default_rtpengine_health_check_interval_secs() -> u64 {
+    5
+}
+
+/// Configuration for siphon's inbound listener that accepts rtpengine's
+/// async event notifications (DTMF, etc.) over NG-protocol TCP.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RtpEngineEventsConfig {
+    /// Socket address to listen on (e.g. ``"0.0.0.0:22226"``).
+    pub listen_addr: String,
+}
+
+/// A user-defined RTPEngine media profile with separate offer/answer NG flags.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MediaProfileConfig {
+    pub offer: NgFlagsConfig,
+    pub answer: NgFlagsConfig,
+}
+
+/// NG protocol flags for one direction (offer or answer).
+#[derive(Debug, Deserialize, Clone)]
+pub struct NgFlagsConfig {
+    /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
+    pub transport_protocol: Option<String>,
+    /// ICE handling: "remove", "force", or "force-relay".
+    pub ice: Option<String>,
+    /// DTLS mode: "passive", "active", or "off".
+    pub dtls: Option<String>,
+    /// SDP fields to replace: "origin".
+    #[serde(default)]
+    pub replace: Vec<String>,
+    /// Additional flags: "trust-address", "symmetric", "asymmetric".
+    #[serde(default)]
+    pub flags: Vec<String>,
+    /// Direction pair for NAT traversal: ["external", "internal"].
+    #[serde(default)]
+    pub direction: Vec<String>,
+    /// Enable call recording in RTPEngine.
+    #[serde(default)]
+    pub record_call: bool,
+    /// Directory path for RTPEngine to write recording files.
+    pub record_path: Option<String>,
+}
+
+/// One or more RTPEngine instances.
+///
+/// Accepts either a single instance or a list:
+/// ```yaml
+/// # Single instance:
+/// media:
+///   rtpengine:
+///     address: "127.0.0.1:22222"
+///
+/// # Multiple instances (round-robin selection):
+/// media:
+///   rtpengine:
+///     instances:
+///       - address: "10.0.0.1:22222"
+///         weight: 2
+///       - address: "10.0.0.2:22222"
+///         weight: 1
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RtpEngineSetConfig {
+    /// A single RTPEngine instance (shorthand).
+    Single(RtpEngineInstanceConfig),
+    /// Multiple instances with optional weights for load-balancing.
+    Set { instances: Vec<RtpEngineInstanceConfig> },
+}
+
+impl RtpEngineSetConfig {
+    /// Return all configured instances as a slice-compatible vec.
+    pub fn instances(&self) -> Vec<&RtpEngineInstanceConfig> {
+        match self {
+            RtpEngineSetConfig::Single(instance) => vec![instance],
+            RtpEngineSetConfig::Set { instances } => instances.iter().collect(),
+        }
+    }
+}
+
+/// Configuration for a single RTPEngine instance.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RtpEngineInstanceConfig {
+    /// NG control protocol address (e.g. "127.0.0.1:22222").
+    pub address: String,
+    /// Timeout in milliseconds for NG protocol responses.
+    #[serde(default = "default_rtpengine_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Weight for load-balancing (higher = more traffic). Default: 1.
+    #[serde(default = "default_rtpengine_weight")]
+    pub weight: u32,
+}
+
+fn default_rtpengine_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_rtpengine_weight() -> u32 {
+    1
+}
+
+// ---------------------------------------------------------------------------
+// Gateway dispatcher
+// ---------------------------------------------------------------------------
+
+/// Gateway dispatcher configuration.
+///
+/// Example siphon.yaml:
+/// ```yaml
+/// gateway:
+///   groups:
+///     - name: "carriers"
+///       algorithm: weighted
+///       probe:
+///         enabled: true
+///         interval_secs: 15
+///         failure_threshold: 3
+///       destinations:
+///         - uri: "sip:gw1.carrier.com:5060"
+///           address: "10.0.0.1:5060"
+///           weight: 3
+///           attrs: { region: "us-east" }
+///         - uri: "sip:gw2.carrier.com:5060"
+///           address: "10.0.0.2:5060"
+///           priority: 2
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayConfig {
+    /// Named destination groups.
+    pub groups: Vec<GatewayGroupConfig>,
+}
+
+/// A named group of destinations.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayGroupConfig {
+    /// Group name — used in `gateway.select("name")`.
+    pub name: String,
+    /// Load-balancing algorithm: "round_robin", "weighted" (default), "hash".
+    #[serde(default = "default_gateway_algorithm")]
+    pub algorithm: String,
+    /// Per-group health probe configuration.
+    #[serde(default)]
+    pub probe: GatewayProbeConfig,
+    /// Destinations in this group.
+    pub destinations: Vec<GatewayDestConfig>,
+}
+
+/// Per-group health probe settings.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayProbeConfig {
+    /// Enable SIP OPTIONS probing. Default: true.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Probe interval in seconds. Default: 30.
+    #[serde(default = "default_gateway_probe_interval")]
+    pub interval_secs: u32,
+    /// Consecutive failures before marking down. Default: 3.
+    #[serde(default = "default_gateway_failure_threshold")]
+    pub failure_threshold: u32,
+    /// User part for the From URI in OPTIONS probes. Default: `"siphon"`.
+    pub from_user: Option<String>,
+    /// Host part for the From URI in OPTIONS probes. Default: local IP.
+    pub from_domain: Option<String>,
+}
+
+impl Default for GatewayProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+            failure_threshold: 3,
+            from_user: None,
+            from_domain: None,
+        }
+    }
+}
+
+/// A single destination in a group.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayDestConfig {
+    /// SIP URI to route to (e.g. "sip:gw1.carrier.com:5060;transport=tls").
+    /// Port and transport can be embedded in the URI and will be derived
+    /// automatically when `address` / `transport` fields are omitted.
+    pub uri: String,
+    /// Socket address for sending (e.g. "10.0.0.1:5060").
+    /// If omitted, resolved from the URI hostname.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Transport protocol: "udp", "tcp", "tls".
+    /// If omitted, derived from URI `;transport=` param (default: "udp").
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Weight for weighted round-robin (higher = more traffic). Default: 1.
+    #[serde(default = "default_gateway_weight")]
+    pub weight: u32,
+    /// Priority group (lower = higher priority, for failover tiers). Default: 1.
+    #[serde(default = "default_gateway_priority")]
+    pub priority: u32,
+    /// User-defined attributes (e.g. {"region": "us-east"}).
+    #[serde(default)]
+    pub attrs: std::collections::HashMap<String, String>,
+}
+
+impl GatewayDestConfig {
+    /// Return the effective transport string: explicit field, URI `;transport=`
+    /// param, or `"udp"` as default.
+    pub fn effective_transport(&self) -> String {
+        if let Some(ref transport) = self.transport {
+            return transport.clone();
+        }
+        let uri_lower = self.uri.to_lowercase();
+        if let Some(pos) = uri_lower.find(";transport=") {
+            let after = &uri_lower[pos + 11..];
+            let end = after
+                .find(|c: char| c == ';' || c == '>' || c == ' ')
+                .unwrap_or(after.len());
+            return after[..end].to_string();
+        }
+        "udp".to_string()
+    }
+}
+
+fn default_gateway_algorithm() -> String {
+    "weighted".to_string()
+}
+fn default_gateway_probe_interval() -> u32 {
+    30
+}
+fn default_gateway_failure_threshold() -> u32 {
+    3
+}
+fn default_gateway_weight() -> u32 {
+    1
+}
+fn default_gateway_priority() -> u32 {
+    1
+}
+
+// ---------------------------------------------------------------------------
+// Session timers (RFC 4028)
+// ---------------------------------------------------------------------------
+
+/// RFC 4028 session timer configuration for B2BUA mode.
+///
+/// Session timers prevent resource leaks from calls whose BYE was lost.
+/// The B2BUA sends periodic re-INVITEs to keep the session alive and tears
+/// down calls that fail to refresh within the negotiated interval.
+///
+/// Example siphon.yaml:
+/// ```yaml
+/// session_timer:
+///   session_expires: 1800
+///   min_se: 90
+///   refresher: uac
+///   enabled: true
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SessionTimerConfig {
+    /// Default Session-Expires value in seconds. Default: 1800 (30 minutes).
+    #[serde(default = "default_session_expires")]
+    pub session_expires: u32,
+    /// Minimum acceptable Session-Expires (Min-SE header). Default: 90.
+    #[serde(default = "default_min_se")]
+    pub min_se: u32,
+    /// Who sends the refresh re-INVITE: uac (default) or uas.
+    #[serde(default = "default_refresher")]
+    pub refresher: SessionRefresher,
+    /// Enable/disable session timers entirely. Default: true.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+}
+
+/// Who is responsible for sending refresh re-INVITEs (RFC 4028).
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRefresher {
+    /// The calling party (UAC) refreshes (default).
+    Uac,
+    /// The called party (UAS) refreshes.
+    Uas,
+    /// The B2BUA itself handles refresh re-INVITEs on both legs.
+    B2bua,
+}
+
+fn default_session_expires() -> u32 {
+    1800
+}
+
+fn default_min_se() -> u32 {
+    90
+}
+
+fn default_refresher() -> SessionRefresher {
+    SessionRefresher::Uac
+}
+
+// ---------------------------------------------------------------------------
+// Rf offline charging (3GPP TS 32.299)
+// ---------------------------------------------------------------------------
+
+/// Top-level `rf:` configuration.
+///
+/// ```yaml
+/// rf:
+///   enabled: true
+///   auto_emit_proxy: true        # ACR-START on 2xx-forward, ACR-STOP on in-dialog BYE
+///   auto_emit_b2bua: true        # ACR-START on Answered, ACR-STOP on Bye/Terminated
+///   auto_emit_register: true     # ACR-EVENT from registrar on_change
+///   interim_interval_secs: 300   # 0 = disabled; CDF ACA-START Acct-Interim-Interval overrides
+///   node_functionality: scscf    # scscf | pcscf | icscf | mrfc | mgcf | bgcf | as | ibcf
+///   service_context_id: "32260@3gpp.org"   # TS 32.260 IMS = 32260, MMTel SC = 32274
+///   peer: cdf1                   # optional explicit peer; default = first 'rf' route, else any peer
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct RfConfig {
+    /// Master switch.  Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Emit ACR-START / ACR-INTERIM / ACR-STOP automatically from the
+    /// proxy 2xx-forward and in-dialog-BYE paths.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_proxy: bool,
+    /// Emit ACR-START / ACR-INTERIM / ACR-STOP automatically from B2BUA
+    /// `CallEvent::Answered` / `Bye` / `Terminated`.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_b2bua: bool,
+    /// Emit ACR-EVENT for every registration state change observed on
+    /// the registrar's on-change broadcast channel.  Default: true.
+    #[serde(default = "default_true")]
+    pub auto_emit_register: bool,
+    /// Default ACR-INTERIM cadence in seconds when the CDF does not
+    /// return an ``Acct-Interim-Interval`` AVP in ACA-START.  Set to 0
+    /// to disable periodic INTERIM.  Default: 0 (disabled).
+    #[serde(default)]
+    pub interim_interval_secs: u32,
+    /// Node-Functionality value baked into auto-emitted records
+    /// (TS 32.299 §7.2.111 — `scscf`, `pcscf`, `icscf`, `mrfc`, `mgcf`,
+    /// `bgcf`, `as`, `ibcf`, `ecscf`, `atcf`, `mmtel`, `tpf`, `atgw`).
+    /// Default: ``"scscf"``.
+    #[serde(default = "default_rf_node_functionality")]
+    pub node_functionality: String,
+    /// Service-Context-Id (TS 32.299 §7.2.91).  Default:
+    /// ``"32260@3gpp.org"`` (TS 32.260 IMS).
+    #[serde(default = "default_rf_service_context_id")]
+    pub service_context_id: String,
+    /// Explicit Diameter peer name to send ACRs to.  When unset, the
+    /// first peer registered with the manager is used (`any_client`).
+    pub peer: Option<String>,
+}
+
+impl Default for RfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_emit_proxy: true,
+            auto_emit_b2bua: true,
+            auto_emit_register: true,
+            interim_interval_secs: 0,
+            node_functionality: default_rf_node_functionality(),
+            service_context_id: default_rf_service_context_id(),
+            peer: None,
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+fn default_rf_node_functionality() -> String { "scscf".to_string() }
+fn default_rf_service_context_id() -> String { "32260@3gpp.org".to_string() }
+
+// ---------------------------------------------------------------------------
+// CDR (Call Detail Records)
+// ---------------------------------------------------------------------------
+
+/// CDR configuration in `siphon.yaml`.
+///
+/// ```yaml
+/// cdr:
+///   enabled: true
+///   include_register: false
+///   channel_size: 10000
+///   backend: file
+///   file:
+///     path: "/var/log/siphon/cdr.jsonl"
+///     rotate_size_mb: 100
+///   # -- or --
+///   backend: syslog
+///   syslog:
+///     target: "10.0.0.5:514"
+///   # -- or --
+///   backend: http
+///   http:
+///     url: "https://collector.example.com/v1/cdr"
+///     auth_header: "Bearer tok123"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct CdrYamlConfig {
+    /// Enable CDR generation. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Include REGISTER events as CDRs. Default: false.
+    #[serde(default)]
+    pub include_register: bool,
+    /// Async channel buffer size. Default: 10000.
+    #[serde(default = "default_cdr_channel_size")]
+    pub channel_size: usize,
+    /// Backend type: "file", "syslog", or "http".
+    #[serde(default = "default_cdr_backend")]
+    pub backend: String,
+    /// File backend settings.
+    pub file: Option<CdrFileConfig>,
+    /// Syslog backend settings.
+    pub syslog: Option<CdrSyslogConfig>,
+    /// HTTP webhook backend settings.
+    pub http: Option<CdrHttpConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CdrFileConfig {
+    /// Path to the JSON-lines CDR file.
+    #[serde(default = "default_cdr_file_path")]
+    pub path: String,
+    /// Rotate when file exceeds this size (MB). Default: 100.
+    #[serde(default = "default_cdr_rotate_size")]
+    pub rotate_size_mb: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CdrSyslogConfig {
+    /// UDP syslog target (host:port).
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CdrHttpConfig {
+    /// HTTP(S) endpoint URL for POST.
+    pub url: String,
+    /// Optional Authorization header value.
+    pub auth_header: Option<String>,
+}
+
+impl CdrYamlConfig {
+    /// Convert YAML config into runtime `CdrConfig`.
+    pub fn to_cdr_config(&self) -> crate::cdr::CdrConfig {
+        let backend = match self.backend.as_str() {
+            "syslog" => {
+                let target = self.syslog.as_ref()
+                    .map(|s| s.target.clone())
+                    .unwrap_or_else(|| "127.0.0.1:514".to_string());
+                crate::cdr::CdrBackendType::Syslog { target }
+            }
+            "http" => {
+                let (url, auth_header) = self.http.as_ref()
+                    .map(|h| (h.url.clone(), h.auth_header.clone()))
+                    .unwrap_or_else(|| ("http://127.0.0.1:9080/cdr".to_string(), None));
+                crate::cdr::CdrBackendType::Http { url, auth_header }
+            }
+            _ => {
+                let (path, rotate_size_mb) = self.file.as_ref()
+                    .map(|f| (f.path.clone(), f.rotate_size_mb))
+                    .unwrap_or_else(|| (default_cdr_file_path(), default_cdr_rotate_size()));
+                crate::cdr::CdrBackendType::File { path, rotate_size_mb }
+            }
+        };
+
+        crate::cdr::CdrConfig {
+            enabled: self.enabled,
+            backend,
+            include_register: self.include_register,
+            channel_size: self.channel_size,
+        }
+    }
+}
+
+fn default_cdr_channel_size() -> usize {
+    10_000
+}
+
+fn default_cdr_backend() -> String {
+    "file".to_string()
+}
+
+fn default_cdr_file_path() -> String {
+    "/var/log/siphon/cdr.jsonl".to_string()
+}
+
+fn default_cdr_rotate_size() -> u64 {
+    100
+}
+
+// ---------------------------------------------------------------------------
+// Outbound Registration (UAC Registrant)
+// ---------------------------------------------------------------------------
+
+/// Outbound registrant configuration in `siphon.yaml`.
+///
+/// ```yaml
+/// registrant:
+///   default_interval: 3600
+///   retry_interval: 60
+///   max_retry_interval: 300
+///   entries:
+///     - aor: "sip:alice@carrier.com"
+///       registrar: "sip:registrar.carrier.com:5060"
+///       user: "alice"
+///       password: "secret123"
+///       realm: "carrier.com"
+///       interval: 1800
+///       contact: "sip:alice@1.2.3.4"
+///       transport: "udp"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantYamlConfig {
+    /// Default registration interval in seconds. Default: 3600.
+    #[serde(default = "default_registrant_interval")]
+    pub default_interval: u32,
+    /// Base retry interval on failure in seconds. Default: 60.
+    #[serde(default = "default_registrant_retry")]
+    pub retry_interval: u64,
+    /// Maximum retry interval (backoff cap) in seconds. Default: 300.
+    #[serde(default = "default_registrant_max_retry")]
+    pub max_retry_interval: u64,
+    /// Static registration entries.
+    #[serde(default)]
+    pub entries: Vec<RegistrantEntryConfig>,
+}
+
+/// A single static registrant entry.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantEntryConfig {
+    /// Address-of-Record (e.g. "sip:alice@carrier.com").
+    pub aor: String,
+    /// Registrar URI (e.g. "sip:registrar.carrier.com:5060").
+    pub registrar: String,
+    /// Authentication username.
+    pub user: String,
+    /// Authentication password.
+    pub password: String,
+    /// Optional realm hint — derived from 401 challenge if omitted.
+    pub realm: Option<String>,
+    /// Registration interval override in seconds.
+    pub interval: Option<u32>,
+    /// Contact URI override (auto-generated if omitted).
+    pub contact: Option<String>,
+    /// Transport: "udp" (default), "tcp", "tls".
+    #[serde(default = "default_registrant_transport")]
+    pub transport: String,
+}
+
+fn default_registrant_interval() -> u32 {
+    3600
+}
+
+fn default_registrant_retry() -> u64 {
+    60
+}
+
+fn default_registrant_max_retry() -> u64 {
+    300
+}
+
+fn default_registrant_transport() -> String {
+    "udp".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Lawful Intercept — ETSI X1/X2/X3 + SIPREC
+// ---------------------------------------------------------------------------
+
+/// Top-level `lawful_intercept:` configuration.
+///
+/// ```yaml
+/// lawful_intercept:
+///   enabled: false
+///   audit_log: "/var/log/siphon/li-audit.log"
+///   x1:
+///     listen: "127.0.0.1:8443"
+///     tls:
+///       certificate: "/etc/siphon/li/x1.crt"
+///       private_key: "/etc/siphon/li/x1.key"
+///       verify_client: true
+///     auth_token: "warrant-auth-xyz"
+///   x2:
+///     delivery_address: "10.0.0.50:6543"
+///     transport: tcp
+///     reconnect_interval_secs: 5
+///     channel_size: 10000
+///   x3:
+///     listen_udp: "127.0.0.1:0"
+///     delivery_address: "10.0.0.50:6544"
+///     transport: udp
+///     encapsulation: etsi
+///   siprec:
+///     srs_uri: "sip:srs@recorder.example.com"
+///     session_copies: 1
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct LawfulInterceptConfig {
+    /// Master switch — disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Mandatory audit trail log file. Every X1 operation is recorded here.
+    pub audit_log: Option<String>,
+    /// X1: ETSI TS 103 221-1 admin interface for intercept provisioning.
+    pub x1: Option<LiX1Config>,
+    /// X2: ETSI TS 102 232 IRI (signaling event) delivery.
+    pub x2: Option<LiX2Config>,
+    /// X3: ETSI TS 102 232 CC (media content) delivery via RTPEngine.
+    pub x3: Option<LiX3Config>,
+    /// SIPREC: RFC 7866 SIP-based media recording.
+    pub siprec: Option<LiSiprecConfig>,
+}
+
+/// X1 admin interface — separate HTTPS listener with mTLS.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiX1Config {
+    /// Bind address for X1 HTTPS API (e.g. "127.0.0.1:8443").
+    pub listen: String,
+    /// TLS settings (mTLS recommended for LEA authentication).
+    pub tls: Option<LiTlsConfig>,
+    /// Optional bearer token for additional authentication.
+    pub auth_token: Option<String>,
+}
+
+/// X2 IRI delivery — ASN.1/BER encoded signaling events over TCP/TLS.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiX2Config {
+    /// Mediation device IRI collector address (host:port).
+    pub delivery_address: String,
+    /// Transport: "tcp" or "tls". Default: "tcp".
+    #[serde(default = "default_li_x2_transport")]
+    pub transport: String,
+    /// Reconnect interval on connection loss. Default: 5.
+    #[serde(default = "default_li_reconnect_interval")]
+    pub reconnect_interval_secs: u64,
+    /// Async channel buffer size. Default: 10000.
+    #[serde(default = "default_li_channel_size")]
+    pub channel_size: usize,
+    /// TLS settings for X2 delivery (when transport = "tls").
+    pub tls: Option<LiTlsConfig>,
+}
+
+/// X3 CC delivery — RTPEngine recording mirror + encapsulation to mediation.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiX3Config {
+    /// Local UDP address to receive mirrored RTP from RTPEngine.
+    /// Default: "127.0.0.1:0" (OS-assigned port).
+    #[serde(default = "default_li_x3_listen")]
+    pub listen_udp: String,
+    /// Mediation device CC collector address (host:port).
+    pub delivery_address: String,
+    /// Transport: "udp" or "tcp". Default: "udp".
+    #[serde(default = "default_li_x3_transport")]
+    pub transport: String,
+    /// Encapsulation format: "etsi" (TS 102 232 CC-PDU) or "raw_ip".
+    #[serde(default = "default_li_x3_encapsulation")]
+    pub encapsulation: String,
+}
+
+/// SIPREC (RFC 7866) — SIP-based media recording.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiSiprecConfig {
+    /// SIP Recording Server URI (e.g. "sip:srs@recorder.example.com").
+    pub srs_uri: String,
+    /// Number of parallel recording sessions per call. Default: 1.
+    #[serde(default = "default_siprec_session_copies")]
+    pub session_copies: u32,
+    /// Transport for SRS INVITE: "udp", "tcp", or "tls". Default: "tcp".
+    #[serde(default = "default_siprec_transport")]
+    pub transport: String,
+    /// RTPEngine media profile for subscribe (media fork) commands. Default: "siprec_src".
+    #[serde(default = "default_siprec_src_profile")]
+    pub rtpengine_profile: String,
+}
+
+/// TLS configuration for LI interfaces (X1 admin, X2/X3 delivery).
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiTlsConfig {
+    /// Path to TLS certificate file.
+    pub certificate: Option<String>,
+    /// Path to TLS private key file.
+    pub private_key: Option<String>,
+    /// CA certificate for verifying the remote peer.
+    pub ca_cert: Option<String>,
+    /// Require client certificate (mTLS). Default: false.
+    #[serde(default)]
+    pub verify_client: bool,
+    /// SNI server name for outbound TLS connections.
+    pub server_name: Option<String>,
+}
+
+fn default_li_x2_transport() -> String { "tcp".to_string() }
+fn default_li_reconnect_interval() -> u64 { 5 }
+fn default_li_channel_size() -> usize { 10_000 }
+fn default_li_x3_listen() -> String { "127.0.0.1:0".to_string() }
+fn default_li_x3_transport() -> String { "udp".to_string() }
+fn default_li_x3_encapsulation() -> String { "etsi".to_string() }
+fn default_siprec_session_copies() -> u32 { 1 }
+fn default_siprec_transport() -> String { "tcp".to_string() }
+fn default_siprec_src_profile() -> String { "siprec_src".to_string() }
+
+// ---------------------------------------------------------------------------
+// SRS — Session Recording Server
+// ---------------------------------------------------------------------------
+
+/// Session Recording Server (SIPREC SRS) — RFC 7866.
+///
+/// When enabled, SIPhon accepts inbound SIPREC INVITEs from external SRCs,
+/// parses the recording metadata, captures audio via RTPEngine, and stores
+/// recordings + metadata.
+///
+/// ```yaml
+/// srs:
+///   enabled: true
+///   recording_dir: "/var/lib/siphon/recordings"
+///   max_sessions: 1000
+///   backend: file
+///   file:
+///     base_dir: "/var/lib/siphon/recordings"
+///   http:
+///     url: "https://api.example.com/recordings"
+///     auth_header: "Bearer tok123"
+///     upload_audio: false
+///   rtpengine_profile: "srs_recording"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SrsConfig {
+    /// Enable SRS functionality. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory for recording files (RTPEngine writes here). Default: "/var/lib/siphon/recordings".
+    #[serde(default = "default_srs_recording_dir")]
+    pub recording_dir: String,
+    /// Maximum concurrent recording sessions. Default: 1000.
+    #[serde(default = "default_srs_max_sessions")]
+    pub max_sessions: usize,
+    /// Backend type: "file" or "http". Default: "file".
+    #[serde(default = "default_srs_backend")]
+    pub backend: String,
+    /// File backend settings.
+    pub file: Option<SrsFileConfig>,
+    /// HTTP webhook backend settings.
+    pub http: Option<SrsHttpConfig>,
+    /// RTPEngine media profile to use for recording. Default: "srs_recording".
+    #[serde(default = "default_srs_rtpengine_profile")]
+    pub rtpengine_profile: String,
+}
+
+/// SRS file backend — writes JSON metadata alongside audio files.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SrsFileConfig {
+    /// Base directory for metadata JSON files.
+    #[serde(default = "default_srs_recording_dir")]
+    pub base_dir: String,
+}
+
+/// SRS HTTP webhook backend — POSTs recording metadata on session end.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SrsHttpConfig {
+    /// HTTP(S) endpoint URL for POST.
+    pub url: String,
+    /// Optional Authorization header value.
+    pub auth_header: Option<String>,
+    /// Upload audio files alongside metadata. Default: false.
+    #[serde(default)]
+    pub upload_audio: bool,
+}
+
+fn default_srs_recording_dir() -> String { "/var/lib/siphon/recordings".to_string() }
+fn default_srs_max_sessions() -> usize { 1000 }
+fn default_srs_backend() -> String { "file".to_string() }
+fn default_srs_rtpengine_profile() -> String { "srs_recording".to_string() }
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LogConfig {
+    pub level: LogLevel,
+    pub format: LogFormat,
+    /// Optional path to a log file (e.g. `/var/log/siphon.log`).
+    /// When set, logs are written to both stderr and the file.
+    pub file: Option<String>,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            format: LogFormat::Pretty,
+            file: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Pretty,
+    Json,
+}
+
+// ---------------------------------------------------------------------------
+// Config loading
+// ---------------------------------------------------------------------------
+
+impl Config {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+            SiphonError::Config(format!("cannot read siphon.yaml: {e}"))
+        })?;
+        let expanded = expand_env_vars(&content);
+        Self::from_str_raw(&expanded)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(yaml: &str) -> Result<Self> {
+        let expanded = expand_env_vars(yaml);
+        Self::from_str_raw(&expanded)
+    }
+
+    /// Parse YAML without env-var expansion (used after expansion is already done).
+    fn from_str_raw(yaml: &str) -> Result<Self> {
+        serde_yml::from_str(yaml)
+            .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))
+    }
+
+    /// Returns true if the given host/IP is one of our configured local domains.
+    pub fn is_local(&self, host: &str) -> bool {
+        self.domain.local.iter().any(|d| d == host)
+    }
+
+    /// Path-form accessor for an extension entry.
+    ///
+    /// Returns `Some(path)` when the entry exists and its value is a YAML
+    /// scalar string (the conventional form for "load my config from this
+    /// file"). Returns `None` when the entry is absent or its value is an
+    /// inline mapping/sequence — extensions that accept inline config
+    /// should call [`Config::extension_config`] instead and walk the
+    /// `serde_yml::Value` themselves.
+    pub fn extension_path(&self, name: &str) -> Option<&Path> {
+        self.extensions
+            .as_ref()?
+            .get(name)?
+            .as_str()
+            .map(Path::new)
+    }
+
+    /// Raw-value accessor for an extension entry. Returns the entry's
+    /// YAML value (any shape) for the extension to interpret. Returns
+    /// `None` when the entry is absent.
+    pub fn extension_config(&self, name: &str) -> Option<&serde_yml::Value> {
+        self.extensions.as_ref()?.get(name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPsec (3GPP TS 33.203)
+// ---------------------------------------------------------------------------
+
+/// IPsec SA management configuration for P-CSCF.
+#[derive(Debug, Deserialize, Clone)]
+pub struct IpsecConfig {
+    /// P-CSCF protected client port.
+    #[serde(default = "default_ipsec_port_c")]
+    pub pcscf_port_c: u16,
+    /// P-CSCF protected server port.
+    #[serde(default = "default_ipsec_port_s")]
+    pub pcscf_port_s: u16,
+    /// XFRM backend.  ``"netlink"`` (default — direct kernel netlink,
+    /// fastest) or ``"ip"`` (legacy ``/sbin/ip xfrm`` shell-out, used
+    /// as a fallback when running in containers without
+    /// CAP_NET_ADMIN-on-netlink or for parity with older deployments).
+    #[serde(default = "default_ipsec_backend")]
+    pub backend: IpsecBackend,
+    /// Optional SPI range for this siphon instance.  When set,
+    /// `allocate_spi_pair()` only returns SPIs in `[start, start+count)`,
+    /// letting multiple siphon processes coexist on the same kernel
+    /// without colliding on SPI values.  When unset (default), siphon
+    /// uses the historical wide range starting at 10000.
+    #[serde(default)]
+    pub spi_range_start: Option<u32>,
+    /// Number of SPIs available in the partition (paired with
+    /// `spi_range_start`).  Default 8192 — far more than any practical
+    /// concurrent registration count.
+    #[serde(default = "default_spi_range_count")]
+    pub spi_range_count: u32,
+    /// Host part siphon writes into the Path URI advertised by
+    /// `request.add_pcscf_path(token)` (RFC 3327 §5 / TS 24.229
+    /// §5.2.7.2 Path-token MT routing).  Must resolve back to *this*
+    /// P-CSCF instance — typically the pod FQDN in a
+    /// StatefulSet deployment so MT requests from the S-CSCF route to
+    /// the instance that owns the inbound flow.  Optional; when unset,
+    /// `add_pcscf_path()` errors at script time so the misconfiguration
+    /// is caught loudly rather than producing unroutable Path URIs.
+    #[serde(default)]
+    pub path_host: Option<String>,
+}
+
+/// XFRM backend selection.  Defaults to `Netlink` on Linux (the only
+/// platform where IPsec is meaningful).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IpsecBackend {
+    /// Direct XFRM netlink protocol — fastest, no shell-out.
+    Netlink,
+    /// Legacy `/sbin/ip xfrm` shell-out — used when netlink is
+    /// unavailable (e.g. inside containers without netlink access).
+    Ip,
+}
+
+fn default_ipsec_port_c() -> u16 {
+    5064
+}
+
+fn default_ipsec_port_s() -> u16 {
+    5066
+}
+
+fn default_ipsec_backend() -> IpsecBackend {
+    IpsecBackend::Netlink
+}
+
+fn default_spi_range_count() -> u32 {
+    8192
+}
+
+// ---------------------------------------------------------------------------
+// STIR/SHAKEN (RFC 8224/8225/8226, ATIS-1000074)
+// ---------------------------------------------------------------------------
+
+/// Top-level `stir:` configuration. Either or both of `signing` (the
+/// Authentication Service) and `verification` (the Verification Service)
+/// may be present; omitting one disables that side.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirConfig {
+    /// Master on/off switch. Defaults to `true` when the `stir:` block is
+    /// present, so adding the block enables it without an extra flag.
+    #[serde(default = "default_stir_enabled")]
+    pub enabled: bool,
+    /// Outbound signing parameters (Authentication Service). When absent,
+    /// `stir.sign()` / `stir.sign_div()` raise.
+    pub signing: Option<StirSigningConfig>,
+    /// Inbound verification parameters (Verification Service). When absent,
+    /// `stir.verify()` raises.
+    pub verification: Option<StirVerificationConfig>,
+}
+
+/// `stir.signing` — Authentication Service parameters.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirSigningConfig {
+    /// Path to the PEM EC P-256 private key used to sign PASSporTs.
+    pub private_key: String,
+    /// Public certificate URL embedded as the Identity `info=` parameter and
+    /// the PASSporT `x5u` header (RFC 8224 §4).
+    pub x5u: String,
+    /// Default attestation level (`A`, `B`, or `C`) when the script does not
+    /// pass one to `stir.sign()`.
+    #[serde(default = "default_stir_attestation")]
+    pub default_attestation: String,
+    /// Fixed `origid` (UUID) to stamp on every PASSporT. When unset, a fresh
+    /// v4 UUID is generated per call.
+    #[serde(default)]
+    pub origid: Option<String>,
+}
+
+/// `stir.verification` — Verification Service parameters.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StirVerificationConfig {
+    /// STI-CA trust-anchor (root) certificate files (PEM).
+    #[serde(default)]
+    pub trust_anchors: Vec<String>,
+    /// Optional directory of PEM trust anchors — every `*.pem`/`*.crt` file
+    /// in it is loaded in addition to `trust_anchors`.
+    #[serde(default)]
+    pub trust_anchor_dir: Option<String>,
+    /// PASSporT `iat` freshness window in seconds (ATIS-1000074).
+    #[serde(default = "default_stir_freshness_secs")]
+    pub freshness_secs: u64,
+    /// Log-only rollout mode: x5u/infra failures degrade to
+    /// `No-TN-Validation` instead of `TN-Validation-Failed`. Genuine bad
+    /// signatures / expired certs / stale PASSporTs always fail.
+    #[serde(default)]
+    pub permissive: bool,
+    /// Default x5u certificate cache TTL in seconds (overridden by a
+    /// response `Cache-Control: max-age`).
+    #[serde(default = "default_stir_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Maximum accepted size of an x5u certificate response, in bytes.
+    #[serde(default = "default_stir_max_cert_bytes")]
+    pub max_cert_bytes: usize,
+    /// Require the leaf certificate to carry the RFC 8226 TNAuthList
+    /// extension.
+    #[serde(default)]
+    pub require_tnauthlist: bool,
+}
+
+fn default_stir_enabled() -> bool {
+    true
+}
+
+fn default_stir_attestation() -> String {
+    "A".to_string()
+}
+
+fn default_stir_freshness_secs() -> u64 {
+    60
+}
+
+fn default_stir_cache_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_stir_max_cert_bytes() -> usize {
+    65536
+}
+
+// ---------------------------------------------------------------------------
+// Initial Filter Criteria (3GPP TS 29.228)
+// ---------------------------------------------------------------------------
+
+/// Top-level `isc:` configuration for Initial Filter Criteria.
+#[derive(Debug, Deserialize, Clone)]
+pub struct IscConfig {
+    /// Path to the iFC XML file containing ServiceProfile elements.
+    pub ifc_xml_path: Option<String>,
+    /// Inline iFC XML (alternative to file path).
+    pub ifc_xml: Option<String>,
+    /// Redis key prefix for iFC profile persistence (default: "siphon:ifc:").
+    /// When the registrar backend is Redis, iFC profiles are automatically
+    /// persisted and restored alongside registrations.
+    #[serde(default = "default_ifc_key_prefix")]
+    pub ifc_key_prefix: String,
+}
+
+fn default_ifc_key_prefix() -> String {
+    "siphon:ifc:".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// 5G Service-Based Interface (SBI)
+// ---------------------------------------------------------------------------
+
+/// Top-level `sbi:` configuration for 5G Service-Based Interface.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SbiYamlConfig {
+    /// NRF discovery endpoint URL.
+    pub nrf_url: Option<String>,
+    /// Default timeout for SBI requests in seconds.
+    #[serde(default = "default_sbi_timeout")]
+    pub timeout_secs: u64,
+    /// OAuth2 client ID for NF authorization.
+    pub oauth2_client_id: Option<String>,
+    /// OAuth2 client secret.
+    pub oauth2_client_secret: Option<String>,
+    /// Npcf base URL (if not using NRF discovery).
+    pub npcf_url: Option<String>,
+    /// Nchf base URL (if not using NRF discovery).
+    pub nchf_url: Option<String>,
+    /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
+    pub notif_listen: Option<String>,
+}
+
+fn default_sbi_timeout() -> u64 {
+    5
+}
+
+impl SbiYamlConfig {
+    pub fn to_sbi_config(&self) -> crate::sbi::SbiConfig {
+        crate::sbi::SbiConfig {
+            nrf_url: self.nrf_url.clone(),
+            timeout_secs: self.timeout_secs,
+            oauth2_client_id: self.oauth2_client_id.clone(),
+            oauth2_client_secret: self.oauth2_client_secret.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_yaml() -> &'static str {
+        r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  backend: memory
+auth:
+  realm: "example.com"
+log:
+  level: info
+  format: pretty
+"#
+    }
+
+    #[test]
+    fn parses_minimal_config() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert_eq!(config.listen.udp[0].address(), "0.0.0.0:5060");
+        assert!(config.listen.tcp.is_empty());
+        assert_eq!(config.domain.local, vec!["example.com"]);
+        assert_eq!(config.script.path, "scripts/proxy_default.py");
+        assert_eq!(config.script.reload, ReloadMode::Auto);
+        assert_eq!(config.registrar.backend, RegistrarBackendType::Memory);
+        assert_eq!(config.registrar.default_expires, 3600);
+        assert_eq!(config.registrar.max_expires, 7200);
+        assert_eq!(config.auth.realm, "example.com");
+        assert_eq!(config.auth.backend, AuthBackendType::Static);
+        assert_eq!(config.log.level, LogLevel::Info);
+        assert_eq!(config.log.format, LogFormat::Pretty);
+        // All optional sections absent
+        assert!(config.advertised_address.is_none());
+        assert!(config.tls.is_none());
+        assert!(config.security.is_none());
+        assert!(config.nat.is_none());
+        assert!(config.tracing.is_none());
+        assert!(config.metrics.is_none());
+        assert!(config.server.is_none());
+        assert!(config.transaction.is_none());
+        assert!(config.dialog.is_none());
+        assert!(config.cache.is_none());
+        assert!(config.media.is_none());
+        assert!(config.gateway.is_none());
+        assert!(config.session_timer.is_none());
+        assert!(config.registrant.is_none());
+        assert!(config.lawful_intercept.is_none());
+        assert!(config.diameter.is_none());
+    }
+
+    #[test]
+    fn parses_full_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+    - "192.168.1.1:5060"
+  tcp:
+    - "0.0.0.0:5060"
+  tls:
+    - "0.0.0.0:5061"
+domain:
+  local:
+    - "example.com"
+    - "127.0.0.1"
+    - "192.168.1.1"
+script:
+  path: "scripts/custom.py"
+  reload: sighup
+registrar:
+  backend: redis
+  default_expires: 1800
+  max_expires: 3600
+  redis:
+    url: "redis://127.0.0.1:6379"
+auth:
+  realm: "example.com"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "hunter2"
+log:
+  level: debug
+  format: json
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.udp.len(), 2);
+        assert_eq!(config.listen.tcp[0].address(), "0.0.0.0:5060");
+        assert_eq!(config.listen.tls[0].address(), "0.0.0.0:5061");
+        assert_eq!(config.domain.local.len(), 3);
+        assert_eq!(config.script.reload, ReloadMode::Sighup);
+        assert_eq!(config.registrar.backend, RegistrarBackendType::Redis);
+        assert_eq!(config.registrar.default_expires, 1800);
+        assert_eq!(config.registrar.redis.as_ref().unwrap().url, "redis://127.0.0.1:6379");
+        assert_eq!(config.auth.users.get("alice").unwrap(), "secret");
+        assert_eq!(config.log.level, LogLevel::Debug);
+        assert_eq!(config.log.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn rejects_invalid_yaml() {
+        let result = Config::from_str("this: is: not: valid: yaml:");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_local_matches_configured_domains() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.is_local("example.com"));
+        assert!(!config.is_local("other.com"));
+    }
+
+    #[test]
+    fn defaults_are_applied_when_fields_omitted() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar: {}
+auth:
+  realm: "example.com"
+log: {}
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.registrar.backend, RegistrarBackendType::Memory);
+        assert_eq!(config.registrar.default_expires, 3600);
+        assert_eq!(config.log.level, LogLevel::Info);
+        assert_eq!(config.log.format, LogFormat::Pretty);
+        assert_eq!(config.script.reload, ReloadMode::Auto);
+    }
+
+    #[test]
+    fn parses_auth_http_backend() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+auth:
+  realm: "example.com"
+  backend: http
+  http:
+    url: "http://127.0.0.1:8000/sip/auth/{username}"
+    timeout_ms: 2000
+    connect_timeout_ms: 500
+    ha1: true
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.auth.backend, AuthBackendType::Http);
+        let http = config.auth.http.unwrap();
+        assert!(http.url.contains("{username}"));
+        assert_eq!(http.timeout_ms, 2000);
+        assert!(http.ha1);
+    }
+
+    #[test]
+    fn parses_registrar_min_expires_and_max_contacts() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  backend: memory
+  default_expires: 300
+  max_expires: 600
+  min_expires: 60
+  max_contacts: 1
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.registrar.min_expires, Some(60));
+        assert_eq!(config.registrar.max_contacts, Some(1));
+        assert_eq!(config.registrar.default_expires, 300);
+    }
+
+    #[test]
+    fn parses_registrant_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrant:
+  default_interval: 1800
+  retry_interval: 30
+  max_retry_interval: 120
+  entries:
+    - aor: "sip:alice@carrier.com"
+      registrar: "sip:registrar.carrier.com:5060"
+      user: "alice"
+      password: "secret123"
+      realm: "carrier.com"
+      interval: 900
+      contact: "sip:alice@1.2.3.4"
+      transport: "tcp"
+    - aor: "sip:bob@carrier.com"
+      registrar: "sip:registrar.carrier.com:5060"
+      user: "bob"
+      password: "hunter2"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let registrant = config.registrant.unwrap();
+        assert_eq!(registrant.default_interval, 1800);
+        assert_eq!(registrant.retry_interval, 30);
+        assert_eq!(registrant.max_retry_interval, 120);
+        assert_eq!(registrant.entries.len(), 2);
+
+        let alice = &registrant.entries[0];
+        assert_eq!(alice.aor, "sip:alice@carrier.com");
+        assert_eq!(alice.registrar, "sip:registrar.carrier.com:5060");
+        assert_eq!(alice.user, "alice");
+        assert_eq!(alice.password, "secret123");
+        assert_eq!(alice.realm.as_deref(), Some("carrier.com"));
+        assert_eq!(alice.interval, Some(900));
+        assert_eq!(alice.contact.as_deref(), Some("sip:alice@1.2.3.4"));
+        assert_eq!(alice.transport, "tcp");
+
+        let bob = &registrant.entries[1];
+        assert_eq!(bob.aor, "sip:bob@carrier.com");
+        assert_eq!(bob.user, "bob");
+        assert_eq!(bob.realm, None);
+        assert_eq!(bob.interval, None);
+        assert_eq!(bob.contact, None);
+        assert_eq!(bob.transport, "udp"); // default
+    }
+
+    #[test]
+    fn parses_security_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+security:
+  rate_limit:
+    window_secs: 10
+    max_requests: 30
+    ban_duration_secs: 3600
+  scanner_block:
+    user_agents:
+      - "sipvicious"
+      - "friendly-scanner"
+  trusted_cidrs:
+    - "10.0.0.0/8"
+  failed_auth_ban:
+    threshold: 10
+    ban_duration_secs: 300
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let sec = config.security.unwrap();
+        let rl = sec.rate_limit.unwrap();
+        assert_eq!(rl.window_secs, 10);
+        assert_eq!(rl.max_requests, 30);
+        assert_eq!(rl.ban_duration_secs, 3600);
+        let sb = sec.scanner_block.unwrap();
+        assert_eq!(sb.user_agents.len(), 2);
+        assert_eq!(sec.trusted_cidrs, vec!["10.0.0.0/8"]);
+        let fab = sec.failed_auth_ban.unwrap();
+        assert_eq!(fab.threshold, 10);
+    }
+
+    #[test]
+    fn parses_tracing_hep_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+tracing:
+  hep:
+    endpoint: "127.0.0.1:9060"
+    version: 3
+    transport: udp
+    agent_id: "siphon-registrar"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let hep = config.tracing.unwrap().hep.unwrap();
+        assert_eq!(hep.endpoint, "127.0.0.1:9060");
+        assert_eq!(hep.version, 3);
+        assert_eq!(hep.transport, HepTransport::Udp);
+        assert_eq!(hep.agent_id.unwrap(), "siphon-registrar");
+    }
+
+    #[test]
+    fn parses_metrics_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+metrics:
+  prometheus:
+    listen: "0.0.0.0:8888"
+    path: "/metrics"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let prom = config.metrics.unwrap().prometheus.unwrap();
+        assert_eq!(prom.listen, "0.0.0.0:8888");
+        assert_eq!(prom.path, "/metrics");
+    }
+
+    #[test]
+    fn parses_nat_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+nat:
+  force_rport: true
+  fix_contact: true
+  fix_register: true
+  keepalive:
+    enabled: true
+    interval_secs: 30
+    failure_threshold: 10
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let nat = config.nat.unwrap();
+        assert!(nat.force_rport);
+        assert!(nat.fix_contact);
+        assert!(nat.fix_register);
+        let ka = nat.keepalive.unwrap();
+        assert!(ka.enabled);
+        assert_eq!(ka.interval_secs, 30);
+    }
+
+    #[test]
+    fn parses_cache_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+cache:
+  - name: "cnam"
+    url: "redis://172.16.0.252:6379"
+    local_ttl_secs: 60
+    local_max_entries: 10000
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let caches = config.cache.unwrap();
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].name, "cnam");
+        assert_eq!(caches[0].local_ttl_secs, Some(60));
+        assert_eq!(caches[0].local_max_entries, Some(10000));
+    }
+
+    #[test]
+    fn parses_transaction_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let tx = config.transaction.unwrap();
+        assert_eq!(tx.timeout_secs, 5);
+        assert_eq!(tx.invite_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parses_tls_server_config() {
+        let yaml = r#"
+listen:
+  tls:
+    - "0.0.0.0:5061"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key: "/etc/siphon/tls/example.com.key"
+  method: "TLSv1_3"
+  verify_client: false
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.certificate, "/etc/siphon/tls/example.com.crt");
+        assert_eq!(tls.method, "TLSv1_3");
+        assert!(!tls.verify_client);
+    }
+
+    #[test]
+    fn parses_media_single_rtpengine() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+    timeout_ms: 500
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        let instances = media.rtpengine.instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].address, "127.0.0.1:22222");
+        assert_eq!(instances[0].timeout_ms, 500);
+        assert_eq!(instances[0].weight, 1);
+    }
+
+    #[test]
+    fn parses_media_multiple_rtpengines() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    instances:
+      - address: "10.0.0.1:22222"
+        weight: 2
+      - address: "10.0.0.2:22222"
+        weight: 1
+        timeout_ms: 2000
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        let instances = media.rtpengine.instances();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].address, "10.0.0.1:22222");
+        assert_eq!(instances[0].weight, 2);
+        assert_eq!(instances[0].timeout_ms, 1000); // default
+        assert_eq!(instances[1].address, "10.0.0.2:22222");
+        assert_eq!(instances[1].weight, 1);
+        assert_eq!(instances[1].timeout_ms, 2000);
+    }
+
+    #[test]
+    fn parses_media_rtpengine_defaults() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        let instances = media.rtpengine.instances();
+        assert_eq!(instances[0].timeout_ms, 1000); // default
+        assert_eq!(instances[0].weight, 1); // default
+    }
+
+    #[test]
+    fn parses_media_custom_profiles() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+  profiles:
+    srtp_to_srtp:
+      offer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin"]
+        direction: ["external", "internal"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin"]
+        direction: ["internal", "external"]
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.profiles.len(), 1);
+        let profile = media.profiles.get("srtp_to_srtp").unwrap();
+        assert_eq!(profile.offer.transport_protocol.as_deref(), Some("RTP/SAVP"));
+        assert_eq!(profile.offer.ice.as_deref(), Some("remove"));
+        assert!(profile.offer.dtls.is_none());
+        assert_eq!(profile.offer.direction, vec!["external", "internal"]);
+        assert_eq!(profile.answer.direction, vec!["internal", "external"]);
+    }
+
+    #[test]
+    fn parses_media_no_profiles_defaults_to_empty() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert!(media.profiles.is_empty());
+    }
+
+    #[test]
+    fn parses_gateway_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+gateway:
+  groups:
+    - name: "carriers"
+      algorithm: weighted
+      probe:
+        enabled: true
+        interval_secs: 15
+        failure_threshold: 5
+      destinations:
+        - uri: "sip:gw1.carrier.com:5060"
+          address: "10.0.0.1:5060"
+          weight: 3
+          priority: 1
+          attrs:
+            region: "us-east"
+        - uri: "sip:gw2.carrier.com:5060"
+          address: "10.0.0.2:5060"
+          transport: "tcp"
+          weight: 1
+          priority: 2
+    - name: "sbc-pool"
+      algorithm: hash
+      destinations:
+        - uri: "sip:sbc1.example.com:5060"
+          address: "10.1.0.1:5060"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let disp = config.gateway.unwrap();
+        assert_eq!(disp.groups.len(), 2);
+
+        let group1 = &disp.groups[0];
+        assert_eq!(group1.name, "carriers");
+        assert_eq!(group1.algorithm, "weighted");
+        assert!(group1.probe.enabled);
+        assert_eq!(group1.probe.interval_secs, 15);
+        assert_eq!(group1.probe.failure_threshold, 5);
+        assert_eq!(group1.destinations.len(), 2);
+        assert_eq!(group1.destinations[0].uri, "sip:gw1.carrier.com:5060");
+        assert_eq!(group1.destinations[0].weight, 3);
+        assert_eq!(group1.destinations[0].transport, None); // omitted
+        assert_eq!(group1.destinations[0].effective_transport(), "udp"); // default
+        assert_eq!(group1.destinations[0].attrs.get("region").unwrap(), "us-east");
+        assert_eq!(group1.destinations[1].transport, Some("tcp".to_string()));
+        assert_eq!(group1.destinations[1].priority, 2);
+
+        let group2 = &disp.groups[1];
+        assert_eq!(group2.name, "sbc-pool");
+        assert_eq!(group2.algorithm, "hash");
+        assert_eq!(group2.destinations[0].weight, 1); // default
+        assert_eq!(group2.destinations[0].priority, 1); // default
+    }
+
+    #[test]
+    fn parses_session_timer_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+session_timer:
+  session_expires: 1800
+  min_se: 90
+  refresher: uac
+  enabled: true
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let timer = config.session_timer.unwrap();
+        assert_eq!(timer.session_expires, 1800);
+        assert_eq!(timer.min_se, 90);
+        assert_eq!(timer.refresher, SessionRefresher::Uac);
+        assert!(timer.enabled);
+    }
+
+    #[test]
+    fn parses_session_timer_defaults() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+session_timer: {}
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let timer = config.session_timer.unwrap();
+        assert_eq!(timer.session_expires, 1800);
+        assert_eq!(timer.min_se, 90);
+        assert_eq!(timer.refresher, SessionRefresher::Uac);
+        assert!(timer.enabled);
+    }
+
+    #[test]
+    fn session_timer_absent_when_not_configured() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.session_timer.is_none());
+    }
+
+    #[test]
+    fn parses_session_timer_refresher_variants() {
+        for (variant, expected) in [
+            ("uac", SessionRefresher::Uac),
+            ("uas", SessionRefresher::Uas),
+        ] {
+            let yaml = format!(r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+session_timer:
+  refresher: {variant}
+"#);
+            let config = Config::from_str(&yaml).unwrap();
+            assert_eq!(config.session_timer.unwrap().refresher, expected);
+        }
+    }
+
+    #[test]
+    fn parses_cdr_file_config() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "cdr:\n",
+            "  enabled: true\n",
+            "  include_register: true\n",
+            "  channel_size: 5000\n",
+            "  backend: file\n",
+            "  file:\n",
+            "    path: \"/tmp/cdr.jsonl\"\n",
+            "    rotate_size_mb: 50\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let cdr = config.cdr.unwrap();
+        assert!(cdr.enabled);
+        assert!(cdr.include_register);
+        assert_eq!(cdr.channel_size, 5000);
+        assert_eq!(cdr.backend, "file");
+
+        let runtime = cdr.to_cdr_config();
+        assert!(runtime.enabled);
+        assert!(runtime.include_register);
+        assert_eq!(runtime.channel_size, 5000);
+        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::File { ref path, rotate_size_mb } if path == "/tmp/cdr.jsonl" && rotate_size_mb == 50));
+    }
+
+    #[test]
+    fn parses_cdr_http_config() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "cdr:\n",
+            "  enabled: true\n",
+            "  backend: http\n",
+            "  http:\n",
+            "    url: \"https://collector.example.com/v1/cdr\"\n",
+            "    auth_header: \"Bearer secret\"\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let cdr = config.cdr.unwrap();
+        assert_eq!(cdr.backend, "http");
+
+        let runtime = cdr.to_cdr_config();
+        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::Http { ref url, ref auth_header } if url == "https://collector.example.com/v1/cdr" && auth_header.as_deref() == Some("Bearer secret")));
+    }
+
+    #[test]
+    fn parses_cdr_syslog_config() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "cdr:\n",
+            "  enabled: true\n",
+            "  backend: syslog\n",
+            "  syslog:\n",
+            "    target: \"10.0.0.5:514\"\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let runtime = config.cdr.unwrap().to_cdr_config();
+        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::Syslog { ref target } if target == "10.0.0.5:514"));
+    }
+
+    #[test]
+    fn cdr_absent_when_not_configured() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.cdr.is_none());
+    }
+
+    #[test]
+    fn parses_lawful_intercept_config() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "lawful_intercept:\n",
+            "  enabled: true\n",
+            "  audit_log: \"/var/log/siphon/li-audit.log\"\n",
+            "  x1:\n",
+            "    listen: \"127.0.0.1:8443\"\n",
+            "    tls:\n",
+            "      certificate: \"/etc/siphon/li/x1.crt\"\n",
+            "      private_key: \"/etc/siphon/li/x1.key\"\n",
+            "      verify_client: true\n",
+            "    auth_token: \"warrant-auth-xyz\"\n",
+            "  x2:\n",
+            "    delivery_address: \"10.0.0.50:6543\"\n",
+            "    transport: tls\n",
+            "    reconnect_interval_secs: 10\n",
+            "    channel_size: 5000\n",
+            "    tls:\n",
+            "      ca_cert: \"/etc/siphon/li/mediation-ca.pem\"\n",
+            "  x3:\n",
+            "    listen_udp: \"127.0.0.1:19000\"\n",
+            "    delivery_address: \"10.0.0.50:6544\"\n",
+            "    transport: udp\n",
+            "    encapsulation: etsi\n",
+            "  siprec:\n",
+            "    srs_uri: \"sip:srs@recorder.example.com\"\n",
+            "    session_copies: 2\n",
+            "    transport: tls\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let li = config.lawful_intercept.unwrap();
+        assert!(li.enabled);
+        assert_eq!(li.audit_log.unwrap(), "/var/log/siphon/li-audit.log");
+
+        // X1
+        let x1 = li.x1.unwrap();
+        assert_eq!(x1.listen, "127.0.0.1:8443");
+        assert_eq!(x1.auth_token.unwrap(), "warrant-auth-xyz");
+        let x1_tls = x1.tls.unwrap();
+        assert!(x1_tls.verify_client);
+        assert_eq!(x1_tls.certificate.unwrap(), "/etc/siphon/li/x1.crt");
+
+        // X2
+        let x2 = li.x2.unwrap();
+        assert_eq!(x2.delivery_address, "10.0.0.50:6543");
+        assert_eq!(x2.transport, "tls");
+        assert_eq!(x2.reconnect_interval_secs, 10);
+        assert_eq!(x2.channel_size, 5000);
+        assert_eq!(x2.tls.unwrap().ca_cert.unwrap(), "/etc/siphon/li/mediation-ca.pem");
+
+        // X3
+        let x3 = li.x3.unwrap();
+        assert_eq!(x3.listen_udp, "127.0.0.1:19000");
+        assert_eq!(x3.delivery_address, "10.0.0.50:6544");
+        assert_eq!(x3.transport, "udp");
+        assert_eq!(x3.encapsulation, "etsi");
+
+        // SIPREC
+        let siprec = li.siprec.unwrap();
+        assert_eq!(siprec.srs_uri, "sip:srs@recorder.example.com");
+        assert_eq!(siprec.session_copies, 2);
+        assert_eq!(siprec.transport, "tls");
+    }
+
+    #[test]
+    fn parses_lawful_intercept_defaults() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "lawful_intercept:\n",
+            "  enabled: false\n",
+            "  x2:\n",
+            "    delivery_address: \"10.0.0.50:6543\"\n",
+            "  x3:\n",
+            "    delivery_address: \"10.0.0.50:6544\"\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let li = config.lawful_intercept.unwrap();
+        assert!(!li.enabled);
+        assert!(li.x1.is_none());
+        assert!(li.siprec.is_none());
+
+        let x2 = li.x2.unwrap();
+        assert_eq!(x2.transport, "tcp");
+        assert_eq!(x2.reconnect_interval_secs, 5);
+        assert_eq!(x2.channel_size, 10_000);
+
+        let x3 = li.x3.unwrap();
+        assert_eq!(x3.listen_udp, "127.0.0.1:0");
+        assert_eq!(x3.transport, "udp");
+        assert_eq!(x3.encapsulation, "etsi");
+    }
+
+    #[test]
+    fn lawful_intercept_absent_when_not_configured() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.lawful_intercept.is_none());
+    }
+
+    #[test]
+    fn parses_diameter_config() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "diameter:\n",
+            "  origin_host: \"siphon.ims.example.com\"\n",
+            "  origin_realm: \"ims.example.com\"\n",
+            "  product_name: \"SIPhon-Test\"\n",
+            "  transport: tcp\n",
+            "  watchdog_interval: 20\n",
+            "  reconnect_delay: 3\n",
+            "  peers:\n",
+            "    - name: \"hss1\"\n",
+            "      host: \"hss1.example.com\"\n",
+            "      port: 3868\n",
+            "      destination_realm: \"example.com\"\n",
+            "    - name: \"hss2\"\n",
+            "      host: \"hss2.example.com\"\n",
+            "      port: 3869\n",
+            "      destination_realm: \"example.com\"\n",
+            "      transport: sctp\n",
+            "      watchdog_interval: 60\n",
+            "    - name: \"ocs1\"\n",
+            "      host: \"ocs.example.com\"\n",
+            "      destination_realm: \"charging.example.com\"\n",
+            "      destination_host: \"ocs-primary.charging.example.com\"\n",
+            "  routes:\n",
+            "    - application: cx\n",
+            "      realm: \"example.com\"\n",
+            "      peers: [\"hss1\", \"hss2\"]\n",
+            "      algorithm: failover\n",
+            "    - application: sh\n",
+            "      peers: [\"hss1\"]\n",
+            "    - application: ro\n",
+            "      peers: [\"ocs1\"]\n",
+            "      algorithm: round_robin\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let diameter = config.diameter.unwrap();
+
+        assert_eq!(diameter.origin_host, "siphon.ims.example.com");
+        assert_eq!(diameter.origin_realm, "ims.example.com");
+        assert_eq!(diameter.product_name.as_deref(), Some("SIPhon-Test"));
+        assert_eq!(diameter.transport, "tcp");
+        assert_eq!(diameter.watchdog_interval, 20);
+        assert_eq!(diameter.reconnect_delay, 3);
+
+        // Peers
+        assert_eq!(diameter.peers.len(), 3);
+        assert_eq!(diameter.peers[0].name, "hss1");
+        assert_eq!(diameter.peers[0].port, 3868);
+        assert_eq!(diameter.peers[0].transport, None);
+        assert_eq!(diameter.peers[1].name, "hss2");
+        assert_eq!(diameter.peers[1].port, 3869);
+        assert_eq!(diameter.peers[1].transport.as_deref(), Some("sctp"));
+        assert_eq!(diameter.peers[1].watchdog_interval, Some(60));
+        assert_eq!(diameter.peers[2].name, "ocs1");
+        assert_eq!(diameter.peers[2].destination_host.as_deref(), Some("ocs-primary.charging.example.com"));
+        assert_eq!(diameter.peers[2].port, 3868); // default
+
+        // Routes
+        assert_eq!(diameter.routes.len(), 3);
+        assert_eq!(diameter.routes[0].application, DiameterApplication::Cx);
+        assert_eq!(diameter.routes[0].realm.as_deref(), Some("example.com"));
+        assert_eq!(diameter.routes[0].peers, vec!["hss1", "hss2"]);
+        assert_eq!(diameter.routes[0].algorithm, "failover");
+        assert_eq!(diameter.routes[1].application, DiameterApplication::Sh);
+        assert!(diameter.routes[1].realm.is_none());
+        assert_eq!(diameter.routes[2].application, DiameterApplication::Ro);
+        assert_eq!(diameter.routes[2].algorithm, "round_robin");
+    }
+
+    #[test]
+    fn diameter_to_peer_config_merges_defaults() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "diameter:\n",
+            "  origin_host: \"siphon.example.com\"\n",
+            "  origin_realm: \"example.com\"\n",
+            "  watchdog_interval: 25\n",
+            "  reconnect_delay: 7\n",
+            "  peers:\n",
+            "    - name: \"hss1\"\n",
+            "      host: \"hss1.example.com\"\n",
+            "      destination_realm: \"example.com\"\n",
+            "    - name: \"hss2\"\n",
+            "      host: \"hss2.example.com\"\n",
+            "      destination_realm: \"example.com\"\n",
+            "      watchdog_interval: 60\n",
+            "      reconnect_delay: 10\n",
+            "  routes:\n",
+            "    - application: cx\n",
+            "      peers: [\"hss1\", \"hss2\"]\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let diameter = config.diameter.as_ref().unwrap();
+
+        // hss1: inherits parent defaults
+        let peer1 = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
+        assert_eq!(peer1.origin_host, "siphon.example.com");
+        assert_eq!(peer1.origin_realm, "example.com");
+        assert_eq!(peer1.host, "hss1.example.com");
+        assert_eq!(peer1.watchdog_interval, 25);
+        assert_eq!(peer1.reconnect_delay, 7);
+        assert_eq!(peer1.product_name, "SIPhon"); // builder fallback
+        assert_eq!(peer1.firmware_revision, 10203); // 1.2.3 → 1*10000+2*100+3
+
+        // hss2: overrides parent defaults
+        let peer2 = diameter.to_peer_config(&diameter.peers[1], "SIPhon", "1.2.3");
+        assert_eq!(peer2.watchdog_interval, 60);
+        assert_eq!(peer2.reconnect_delay, 10);
+    }
+
+    #[test]
+    fn diameter_to_peer_config_collects_app_ids() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "diameter:\n",
+            "  origin_host: \"siphon.example.com\"\n",
+            "  origin_realm: \"example.com\"\n",
+            "  peers:\n",
+            "    - name: \"hss1\"\n",
+            "      host: \"hss1.example.com\"\n",
+            "      destination_realm: \"example.com\"\n",
+            "  routes:\n",
+            "    - application: cx\n",
+            "      peers: [\"hss1\"]\n",
+            "    - application: sh\n",
+            "      peers: [\"hss1\"]\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let diameter = config.diameter.as_ref().unwrap();
+        let peer_config = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
+
+        // hss1 is in both Cx and Sh routes — should get both app IDs
+        assert_eq!(peer_config.application_ids.len(), 2);
+        assert_eq!(
+            peer_config.application_ids[0],
+            DiameterApplication::Cx.to_app_id()
+        );
+        assert_eq!(
+            peer_config.application_ids[1],
+            DiameterApplication::Sh.to_app_id()
+        );
+    }
+
+    #[test]
+    fn diameter_peers_for_application() {
+        let yaml = concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "diameter:\n",
+            "  origin_host: \"siphon.example.com\"\n",
+            "  origin_realm: \"example.com\"\n",
+            "  peers:\n",
+            "    - name: \"hss1\"\n",
+            "      host: \"hss1.example.com\"\n",
+            "      destination_realm: \"example.com\"\n",
+            "    - name: \"hss2\"\n",
+            "      host: \"hss2.example.com\"\n",
+            "      destination_realm: \"example.com\"\n",
+            "    - name: \"ocs1\"\n",
+            "      host: \"ocs.example.com\"\n",
+            "      destination_realm: \"charging.example.com\"\n",
+            "  routes:\n",
+            "    - application: cx\n",
+            "      realm: \"example.com\"\n",
+            "      peers: [\"hss1\", \"hss2\"]\n",
+            "    - application: ro\n",
+            "      peers: [\"ocs1\"]\n",
+        );
+        let config = Config::from_str(yaml).unwrap();
+        let diameter = config.diameter.as_ref().unwrap();
+
+        // Cx with matching realm
+        let cx_peers = diameter.peers_for_application(&DiameterApplication::Cx, Some("example.com"));
+        assert_eq!(cx_peers.len(), 2);
+        assert_eq!(cx_peers[0].name, "hss1");
+        assert_eq!(cx_peers[1].name, "hss2");
+
+        // Cx with non-matching realm
+        let cx_wrong = diameter.peers_for_application(&DiameterApplication::Cx, Some("other.com"));
+        assert!(cx_wrong.is_empty());
+
+        // Cx with no realm filter — still matches (route realm is optional filter)
+        let cx_any = diameter.peers_for_application(&DiameterApplication::Cx, None);
+        assert_eq!(cx_any.len(), 2);
+
+        // Ro — no realm on route
+        let ro_peers = diameter.peers_for_application(&DiameterApplication::Ro, None);
+        assert_eq!(ro_peers.len(), 1);
+        assert_eq!(ro_peers[0].name, "ocs1");
+
+        // Rx — not configured
+        let rx_peers = diameter.peers_for_application(&DiameterApplication::Rx, None);
+        assert!(rx_peers.is_empty());
+    }
+
+    #[test]
+    fn diameter_absent_when_not_configured() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.diameter.is_none());
+    }
+
+    #[test]
+    fn absent_isc_and_sbi() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.isc.is_none());
+        assert!(config.sbi.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Environment variable expansion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_env_var_set() {
+        std::env::set_var("SIPHON_TEST_HOST", "10.0.0.1");
+        let result = expand_env_vars("host: ${SIPHON_TEST_HOST}");
+        assert_eq!(result, "host: 10.0.0.1");
+        std::env::remove_var("SIPHON_TEST_HOST");
+    }
+
+    #[test]
+    fn expand_env_var_unset_no_default() {
+        std::env::remove_var("SIPHON_TEST_MISSING");
+        let result = expand_env_vars("host: ${SIPHON_TEST_MISSING}");
+        assert_eq!(result, "host: ");
+    }
+
+    #[test]
+    fn expand_env_var_unset_with_default() {
+        std::env::remove_var("SIPHON_TEST_MISSING2");
+        let result = expand_env_vars("host: ${SIPHON_TEST_MISSING2:-localhost}");
+        assert_eq!(result, "host: localhost");
+    }
+
+    #[test]
+    fn expand_env_var_empty_uses_default() {
+        std::env::set_var("SIPHON_TEST_EMPTY", "");
+        let result = expand_env_vars("host: ${SIPHON_TEST_EMPTY:-fallback}");
+        assert_eq!(result, "host: fallback");
+        std::env::remove_var("SIPHON_TEST_EMPTY");
+    }
+
+    #[test]
+    fn expand_env_var_set_ignores_default() {
+        std::env::set_var("SIPHON_TEST_PRIO", "actual");
+        let result = expand_env_vars("val: ${SIPHON_TEST_PRIO:-ignored}");
+        assert_eq!(result, "val: actual");
+        std::env::remove_var("SIPHON_TEST_PRIO");
+    }
+
+    #[test]
+    fn expand_env_var_multiple() {
+        std::env::set_var("SIPHON_TEST_A", "alpha");
+        std::env::set_var("SIPHON_TEST_B", "beta");
+        let result = expand_env_vars("${SIPHON_TEST_A}:${SIPHON_TEST_B}");
+        assert_eq!(result, "alpha:beta");
+        std::env::remove_var("SIPHON_TEST_A");
+        std::env::remove_var("SIPHON_TEST_B");
+    }
+
+    #[test]
+    fn expand_env_var_no_placeholders() {
+        let input = "listen:\n  udp: \"0.0.0.0:5060\"";
+        assert_eq!(expand_env_vars(input), input);
+    }
+
+    #[test]
+    fn expand_env_var_in_config_parse() {
+        std::env::set_var("SIPHON_TEST_DOMAIN", "test.example.com");
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "${SIPHON_TEST_DOMAIN}"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  enabled: false
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.domain.local[0], "test.example.com");
+        std::env::remove_var("SIPHON_TEST_DOMAIN");
+    }
+
+    // --- DSCP / DiffServ tests ---
+
+    #[test]
+    fn parse_dscp_named_values() {
+        assert_eq!(parse_dscp("CS0").unwrap(), 0);
+        assert_eq!(parse_dscp("BE").unwrap(), 0);
+        assert_eq!(parse_dscp("CS1").unwrap(), 8);
+        assert_eq!(parse_dscp("AF11").unwrap(), 10);
+        assert_eq!(parse_dscp("AF12").unwrap(), 12);
+        assert_eq!(parse_dscp("AF13").unwrap(), 14);
+        assert_eq!(parse_dscp("CS2").unwrap(), 16);
+        assert_eq!(parse_dscp("AF21").unwrap(), 18);
+        assert_eq!(parse_dscp("AF22").unwrap(), 20);
+        assert_eq!(parse_dscp("AF23").unwrap(), 22);
+        assert_eq!(parse_dscp("CS3").unwrap(), 24);
+        assert_eq!(parse_dscp("AF31").unwrap(), 26);
+        assert_eq!(parse_dscp("AF32").unwrap(), 28);
+        assert_eq!(parse_dscp("AF33").unwrap(), 30);
+        assert_eq!(parse_dscp("CS4").unwrap(), 32);
+        assert_eq!(parse_dscp("AF41").unwrap(), 34);
+        assert_eq!(parse_dscp("AF42").unwrap(), 36);
+        assert_eq!(parse_dscp("AF43").unwrap(), 38);
+        assert_eq!(parse_dscp("CS5").unwrap(), 40);
+        assert_eq!(parse_dscp("EF").unwrap(), 46);
+        assert_eq!(parse_dscp("CS6").unwrap(), 48);
+        assert_eq!(parse_dscp("CS7").unwrap(), 56);
+    }
+
+    #[test]
+    fn parse_dscp_case_insensitive() {
+        assert_eq!(parse_dscp("cs3").unwrap(), 24);
+        assert_eq!(parse_dscp("ef").unwrap(), 46);
+        assert_eq!(parse_dscp("af41").unwrap(), 34);
+        assert_eq!(parse_dscp("Cs3").unwrap(), 24);
+    }
+
+    #[test]
+    fn parse_dscp_raw_integers() {
+        assert_eq!(parse_dscp("0").unwrap(), 0);
+        assert_eq!(parse_dscp("24").unwrap(), 24);
+        assert_eq!(parse_dscp("46").unwrap(), 46);
+        assert_eq!(parse_dscp("63").unwrap(), 63);
+    }
+
+    #[test]
+    fn parse_dscp_rejects_out_of_range() {
+        assert!(parse_dscp("64").is_err());
+        assert!(parse_dscp("255").is_err());
+    }
+
+    #[test]
+    fn parse_dscp_rejects_invalid() {
+        assert!(parse_dscp("INVALID").is_err());
+        assert!(parse_dscp("CS8").is_err());
+        assert!(parse_dscp("").is_err());
+    }
+
+    #[test]
+    fn dscp_to_tos_conversion() {
+        assert_eq!(dscp_to_tos(0), 0);      // BE
+        assert_eq!(dscp_to_tos(24), 96);     // CS3 → signaling
+        assert_eq!(dscp_to_tos(46), 184);    // EF  → voice media
+        assert_eq!(dscp_to_tos(34), 136);    // AF41 → video
+        assert_eq!(dscp_to_tos(63), 252);    // max DSCP
+    }
+
+    #[test]
+    fn listen_config_defaults_to_cs3() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert_eq!(config.listen.dscp, Some(24), "default DSCP should be CS3 (24)");
+    }
+
+    #[test]
+    fn listen_config_dscp_from_yaml_string() {
+        let yaml = r#"
+listen:
+  dscp: EF
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(46));
+    }
+
+    #[test]
+    fn listen_config_dscp_from_yaml_integer() {
+        let yaml = r#"
+listen:
+  dscp: 24
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(24));
+    }
+
+    #[test]
+    fn listen_entry_per_listener_dscp_override() {
+        let yaml = r#"
+listen:
+  dscp: CS3
+  udp:
+    - address: "0.0.0.0:5060"
+      dscp: EF
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.dscp, Some(24));
+        assert_eq!(config.listen.udp[0].dscp(), Some(46));
+    }
+
+    #[test]
+    fn listen_entry_plain_has_no_dscp() {
+        let entry = ListenEntry::Plain("0.0.0.0:5060".to_string());
+        assert_eq!(entry.dscp(), None);
+    }
+
+    // --- GatewayDestConfig::effective_transport tests ---
+
+    fn gateway_dest(uri: &str, transport: Option<&str>) -> GatewayDestConfig {
+        GatewayDestConfig {
+            uri: uri.to_string(),
+            address: None,
+            transport: transport.map(|s| s.to_string()),
+            weight: 1,
+            priority: 1,
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn effective_transport_explicit_field_wins() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tls", Some("tcp"));
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_from_uri_tls() {
+        let dest = gateway_dest("sip:gw.example.com:5061;transport=tls", None);
+        assert_eq!(dest.effective_transport(), "tls");
+    }
+
+    #[test]
+    fn effective_transport_from_uri_tcp() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tcp", None);
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_case_insensitive() {
+        let dest = gateway_dest("sip:gw.example.com;Transport=TLS", None);
+        assert_eq!(dest.effective_transport(), "tls");
+    }
+
+    #[test]
+    fn effective_transport_param_not_last() {
+        let dest = gateway_dest("sip:gw.example.com;transport=tcp;lr", None);
+        assert_eq!(dest.effective_transport(), "tcp");
+    }
+
+    #[test]
+    fn effective_transport_defaults_to_udp() {
+        let dest = gateway_dest("sip:gw.example.com:5060", None);
+        assert_eq!(dest.effective_transport(), "udp");
+    }
+
+    // -----------------------------------------------------------------------
+    // extensions: section
+    // -----------------------------------------------------------------------
+
+    fn extensions_yaml(extensions_block: &str) -> String {
+        format!(
+            r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  backend: memory
+auth:
+  realm: "example.com"
+log:
+  level: info
+  format: pretty
+{extensions_block}
+"#
+        )
+    }
+
+    #[test]
+    fn extensions_absent_when_unset() {
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.extensions.is_none());
+        assert!(config.extension_path("anything").is_none());
+        assert!(config.extension_config("anything").is_none());
+    }
+
+    #[test]
+    fn extensions_path_form() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let path = config
+            .extension_path("foo")
+            .expect("foo extension should resolve to a path");
+        assert_eq!(path, Path::new("/etc/siphon/foo.yaml"));
+    }
+
+    #[test]
+    fn extensions_inline_form() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  bar:
+    listen: "0.0.0.0:8080"
+    workers: 4
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        // The path accessor returns None for non-string entries.
+        assert!(config.extension_path("bar").is_none());
+
+        let value = config
+            .extension_config("bar")
+            .expect("bar extension should resolve to a value");
+        let mapping = value.as_mapping().expect("bar should be a mapping");
+        let listen = mapping
+            .get(serde_yml::Value::String("listen".to_owned()))
+            .and_then(|v| v.as_str())
+            .expect("listen key");
+        assert_eq!(listen, "0.0.0.0:8080");
+        let workers = mapping
+            .get(serde_yml::Value::String("workers".to_owned()))
+            .and_then(|v| v.as_u64())
+            .expect("workers key");
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn extensions_mixed_forms_coexist() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+  bar:
+    key: value
+  baz: 42
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        assert_eq!(
+            config.extension_path("foo"),
+            Some(Path::new("/etc/siphon/foo.yaml")),
+        );
+        assert!(config.extension_path("bar").is_none());
+        assert!(config.extension_config("bar").is_some());
+        // Numeric scalar — neither a path nor an inline mapping.
+        assert!(config.extension_path("baz").is_none());
+        assert_eq!(
+            config
+                .extension_config("baz")
+                .and_then(|v| v.as_u64()),
+            Some(42),
+        );
+    }
+
+    #[test]
+    fn extensions_unknown_name_returns_none() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  foo: /etc/siphon/foo.yaml
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        assert!(config.extension_path("missing").is_none());
+        assert!(config.extension_config("missing").is_none());
+    }
+
+    #[test]
+    fn extensions_preserve_yaml_order() {
+        let yaml = extensions_yaml(
+            r#"extensions:
+  zeta: /a
+  alpha: /b
+  middle: /c
+"#,
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let extensions = config.extensions.expect("extensions present");
+        let names: Vec<&str> = extensions.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["zeta", "alpha", "middle"]);
+    }
+}

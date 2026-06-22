@@ -1,0 +1,133 @@
+# ---------------------------------------------------------------------------
+# SIPhon configuration — Arnacon WebRTC <-> SBC bridge
+#
+# Replaces the old Kamailio ron_kamailio.cfg.  All environment-specific values
+# (${VAR}) are exported by docker/docker-entrypoint.sh from the active config.json
+# before `siphon --config` is exec'd.  SIPhon expands ${VAR} / ${VAR:-default}
+# at load time.
+#
+#   SIPHON_BIND_IP    private/interface IP to bind sockets on (e.g. 172.31.x.x)
+#   SIPHON_PUBLIC_IP  public IP advertised in Via/Contact/SDP (e.g. EC2 EIP)
+#   SIPHON_DOMAIN     FQDN that matches the TLS cert CN (e.g. ron1.cellact.nl)
+#   SIPHON_WSS_PORT   WSS listener port for sip.js/WebRTC clients (e.g. 8443)
+#   TLS_CERT_PATH     Let's Encrypt live dir holding fullchain.pem + privkey.pem
+#   RTPENGINE_ADDRESS RTPEngine NG control endpoint (e.g. 127.0.0.1:22222 or
+#                     3.125.225.232:2223 for a remote media box)
+# ---------------------------------------------------------------------------
+
+listen:
+  # sip.js leg from arnacon-webrtc-service (secure WebSocket, shares tls: cert).
+  # Internal-only hop: end-user devices talk to the webrtc-service (FCM + werift),
+  # never to SIPhon. The service connects with wss:// to ${SIPHON_DOMAIN} so the
+  # cert validates -- point the service's kamailioWssHost at the domain, not an IP.
+  wss:
+    - address: "${SIPHON_BIND_IP}:${SIPHON_WSS_PORT}"
+      advertise: "${SIPHON_DOMAIN}"
+  # SBC trunk + OpenAI realtime leg (SIP over TLS).
+  tls:
+    - address: "${SIPHON_BIND_IP}:5061"
+      advertise: "${SIPHON_DOMAIN}"
+  # Plain SIP — keepalives / diagnostics.
+  udp:
+    - "${SIPHON_BIND_IP}:5060"
+  tcp:
+    - "${SIPHON_BIND_IP}:5060"
+
+# Public IP stamped into Via/Contact/SDP (box binds a private IP behind 1:1 NAT).
+advertised_address: "${SIPHON_PUBLIC_IP}"
+
+# Hosts treated as "ours" (drives SipUri.is_local in the policy script).
+domain:
+  local:
+    - "${SIPHON_DOMAIN}"
+    - "${SIPHON_PUBLIC_IP}"
+    - "${SIPHON_BIND_IP}"
+
+# Single TLS cert for both the tls: and wss: listeners (Let's Encrypt, as before).
+tls:
+  certificate: "${TLS_CERT_PATH}/fullchain.pem"
+  private_key: "${TLS_CERT_PATH}/privkey.pem"
+  # sip.js browsers + most SBCs negotiate 1.2; bump to TLSv1_3 if your peers allow.
+  method: "TLSv1_2"
+
+# The routing brain. Hot-reloaded on change (no restart).
+script:
+  path: "/etc/siphon/repo/sip_code/arnacon_policy.py"
+  reload: auto
+
+# In-memory AoR -> Contact bindings. No external DB; auth is bypassed in the
+# script (crypto is validated client/service-side, same as the Kamailio setup).
+registrar:
+  backend: memory
+  default_expires: 300
+  max_expires: 3600
+
+# NAT traversal for WebRTC/roaming clients (replaces force_rport + fix_nated_*).
+nat:
+  force_rport: true
+  fix_contact: true
+  fix_register: true
+  keepalive:
+    enabled: true
+    interval_secs: 30
+    failure_threshold: 10
+
+# RTPEngine endpoint (local or remote). Custom profiles below reproduce, flag
+# for flag, the rtpengine_offer/answer calls the old cfg made by hand.
+media:
+  rtpengine:
+    address: "${RTPENGINE_ADDRESS:-127.0.0.1:22222}"
+    timeout_ms: 2000
+  sdp_name: "Arnacon"
+  profiles:
+    # OUTBOUND  WebRTC(UE) --> SBC.
+    #   offer  : present plain G.711 RTP to the SBC (strip ICE/DTLS, force PCMU/PCMA)
+    #   answer : bring DTLS-SRTP + ICE back to the browser
+    webrtc_to_sbc:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin", "session-connection"]
+        flags: ["rtcp-mux-demux", "codec-mask-OPUS", "transcode-PCMU", "transcode-PCMA"]
+        direction: ["external", "internal"]
+      answer:
+        transport_protocol: "RTP/SAVPF"
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin", "session-connection"]
+        flags: ["rtcp-mux-offer"]
+        direction: ["internal", "external"]
+    # INBOUND  SBC --> WebRTC(UE).
+    #   offer  : turn the SBC's plain RTP into a WebRTC offer for the browser
+    #   answer : strip the browser's WebRTC answer back to plain RTP for the SBC
+    sbc_to_webrtc:
+      offer:
+        transport_protocol: "RTP/SAVPF"
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin", "session-connection"]
+        flags: ["rtcp-mux-offer", "SDES-off"]
+        direction: ["external", "internal"]
+      answer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin", "session-connection"]
+        direction: ["internal", "external"]
+    # OpenAI realtime bridge (extension 2005) — plain RTP/PCMU to the OpenAI edge.
+    openai_bridge:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        flags: ["rtcp-mux-demux", "codec-mask-all", "transcode-PCMU"]
+        direction: ["internal", "external"]
+      answer:
+        transport_protocol: "RTP/AVP"
+        replace: ["origin", "session-connection"]
+        direction: ["external", "internal"]
+
+log:
+  level: info
+  format: pretty

@@ -1,0 +1,106 @@
+{
+  "development": {
+    "services": {
+      "esimera": {
+        "providerId": "esimera",
+        "status": "active",
+        "domains": ["esimeratest.global", "esimera.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9100/inbound-call"
+      },
+      "secnum": {
+        "providerId": "secnum",
+        "status": "active",
+        "domains": ["secnumtest.global", "secnum.global", "cellactm.global", "cellactl.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9101/inbound-call"
+      },
+      "phonemyemail": {
+        "providerId": "phonemyemail",
+        "status": "active",
+        "domains": ["phonemyemail.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9102/inbound-call"
+      },
+      "email": {
+        "providerId": "email",
+        "status": "active",
+        "domains": ["email.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9103/inbound-call"
+      },
+      "vodaphone": {
+        "providerId": "vodaphone",
+        "status": "active",
+        "domains": ["vodaphonetest.global", "vodaphone.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "67.67.67.67",
+        "callbackPort": "https://test2.cellact.nl:9104/inbound-call"
+      },
+      "basicService": {
+        "providerId": "basicService",
+        "status": "active",
+        "domains": ["basicservice.global"],
+        "trustedIngressIps": ["127.0.0.1"],
+        "outboundSbcAddress": "",
+        "callbackPort": "https://test2.cellact.nl:9105/inbound-call"
+      }
+    }
+  },
+  "production": {
+    "services": {
+      "esimera": {
+        "providerId": "esimera",
+        "status": "active",
+        "domains": ["esimera.global", "esimeratest.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9100/inbound-call"
+      },
+      "secnum": {
+        "providerId": "secnum",
+        "status": "active",
+        "domains": ["secnum.global", "secnumtest.global", "cellactm.global", "cellactl.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9101/inbound-call"
+      },
+      "phonemyemail": {
+        "providerId": "phonemyemail",
+        "status": "active",
+        "domains": ["phonemyemail.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9102/inbound-call"
+      },
+      "email": {
+        "providerId": "email",
+        "status": "active",
+        "domains": ["email.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "185.62.121.10",
+        "callbackPort": "https://test2.cellact.nl:9103/inbound-call"
+      },
+      "vodaphone": {
+        "providerId": "vodaphone",
+        "status": "active",
+        "domains": ["vodaphone.global", "vodaphonetest.global"],
+        "trustedIngressIps": ["51.85.90.127"],
+        "outboundSbcAddress": "67.67.67.67",
+        "callbackPort": "https://test2.cellact.nl:9104/inbound-call"
+      },
+      "basicService": {
+        "providerId": "basicService",
+        "status": "active",
+        "domains": ["basicservice.global"],
+        "trustedIngressIps": ["127.0.0.1"],
+        "outboundSbcAddress": "",
+        "callbackPort": "https://test2.cellact.nl:9105/inbound-call"
+      }
+    }
+  }
+}

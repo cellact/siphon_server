@@ -1,0 +1,26 @@
+services:
+  siphon:
+    build:
+      # Build from local cloned SIPhon source.
+      context: ../siphon
+      dockerfile: Dockerfile
+    container_name: test2_siphon
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-development}
+      # Repo root inside the container (see volume below). The entrypoint picks
+      # config/config.json over sip_code/config.json from here.
+      SIPHON_REPO: /etc/siphon/repo
+      # Free-threaded CPython 3.14t requirement (matches the image default).
+      PYTHON_GIL: "0"
+    entrypoint: ["/bin/sh", "/etc/siphon/repo/docker/docker-entrypoint.sh"]
+    volumes:
+      # Whole project (read-only): sip_code/ (committed default) + optional,
+      # gitignored config/ (server-managed overrides) + docker/entrypoint.
+      - ..:/etc/siphon/repo:ro
+      # Provider/SBC catalog — same files arnacon-webrtc-service reads.
+      - ${WEBRTC_GLOBAL_CONFIG_SOURCE:-/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json}:/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json:ro
+      - ${WEBRTC_SERVICES_SOURCE:-/etc/webrtcservice/node_modules/arnacon-webrtc-service/services}:/etc/webrtcservice/node_modules/arnacon-webrtc-service/services:ro
+      # TLS certs (Let's Encrypt) referenced by siphon.yaml.
+      - /etc/letsencrypt:/etc/letsencrypt:ro

@@ -1,0 +1,18 @@
+/target
+fuzz/target/
+sbom.spdx.json
+sbom.cdx.json
+__pycache__/
+*.pyc
+*.log
+.venv/
+sdk/.venv/
+sdk/dist/
+sdk/*.egg-info/
+.claude/
+CLAUDE.md
+
+# Private deployment configs
+
+# Private test fixtures
+sipp/ipsec/
