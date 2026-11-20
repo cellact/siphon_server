@@ -1,0 +1,4 @@
+# Not the live listen list. docker-entrypoint.sh writes /run/siphon/http.yaml
+# with one server per clientIngress.logicProviders[].notifyPort.
+# Linux dual-stack: bind [::] only (IPV6_V6ONLY=0). Also binding 0.0.0.0 → EADDRINUSE.
+# siphon-http does not expand ${VAR}; the entrypoint inlines the cert paths.

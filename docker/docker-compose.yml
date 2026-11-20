@@ -1,26 +1,87 @@
 services:
+  # Double OpenSSL hop: SIPhon dials TLS here (modern kx → Via/Contact say TLS:5061),
+  # shim dials carrier SBC TLS (RSA-kx). R-URI/To still name the real SBC.
+  # Plain TCP listen made Via: TCP :5060 — TBSIP 100s on-conn then never delivers 200.
+  sbc-tls-shim:
+    image: alpine/socat:latest
+    container_name: test2_sbc_tls_shim
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        SBC_UPSTREAM_HOST=185.62.121.10
+        SBC_UPSTREAM_PORT=5061
+        SBC_SHIM_LISTEN_PORT=15061
+        SBC_NL_UPSTREAM_HOST=3.66.95.165
+        SBC_NL_UPSTREAM_PORT=5061
+        SBC_NL_SHIM_LISTEN_PORT=15062
+        SBC_SHIM_CERT=/etc/letsencrypt/live/srv921000.hstgr.cloud/fullchain.pem
+        SBC_SHIM_KEY=/etc/letsencrypt/live/srv921000.hstgr.cloud/privkey.pem
+        if [ ! -f "$${SBC_SHIM_CERT}" ] && [ -f /etc/letsencrypt/live/ron1.cellact.nl/fullchain.pem ]; then
+          SBC_SHIM_CERT=/etc/letsencrypt/live/ron1.cellact.nl/fullchain.pem
+          SBC_SHIM_KEY=/etc/letsencrypt/live/ron1.cellact.nl/privkey.pem
+        fi
+        echo "sbc-tls-shim: OPENSSL-LISTEN:127.0.0.1:$${SBC_SHIM_LISTEN_PORT} -> OPENSSL:$${SBC_UPSTREAM_HOST}:$${SBC_UPSTREAM_PORT} (socat -v, no SIP rewrite)"
+        echo "sbc-tls-shim: OPENSSL-LISTEN:127.0.0.1:$${SBC_NL_SHIM_LISTEN_PORT} -> OPENSSL:$${SBC_NL_UPSTREAM_HOST}:$${SBC_NL_UPSTREAM_PORT} (socat -v, no SIP rewrite)"
+        # -v logs bytes to stderr; OPENSSL wrap only — does NOT edit SIP/SDP.
+        socat -v \
+          OPENSSL-LISTEN:$${SBC_NL_SHIM_LISTEN_PORT},bind=127.0.0.1,fork,reuseaddr,cert=$${SBC_SHIM_CERT},key=$${SBC_SHIM_KEY},verify=0 \
+          OPENSSL:$${SBC_NL_UPSTREAM_HOST}:$${SBC_NL_UPSTREAM_PORT},verify=0 &
+        exec socat -v \
+          OPENSSL-LISTEN:$${SBC_SHIM_LISTEN_PORT},bind=127.0.0.1,fork,reuseaddr,cert=$${SBC_SHIM_CERT},key=$${SBC_SHIM_KEY},verify=0 \
+          OPENSSL:$${SBC_UPSTREAM_HOST}:$${SBC_UPSTREAM_PORT},verify=0
+
   siphon:
+    depends_on:
+      - sbc-tls-shim
     build:
-      # Build from local cloned SIPhon source.
-      context: ../siphon
-      dockerfile: Dockerfile
+      # Repo root. siphon-edge is compiled in the image; siphon-sip comes from upstream main.
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-1}
     container_name: test2_siphon
     network_mode: host
     restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       DEPLOY_ENV: ${DEPLOY_ENV:-development}
-      # Repo root inside the container (see volume below). The entrypoint picks
-      # config/config.json over sip_code/config.json from here.
-      SIPHON_REPO: /etc/siphon/repo
-      # Free-threaded CPython 3.14t requirement (matches the image default).
-      PYTHON_GIL: "0"
-    entrypoint: ["/bin/sh", "/etc/siphon/repo/docker/docker-entrypoint.sh"]
+      SIPHON_CONFIG_PATH: /etc/arnacon/config.json
+      SIPHON_SCRIPT_PATH: /etc/siphon/scripts/siphon_app.py
+      SIPHON_YAML_TEMPLATE: /etc/siphon/siphon.yaml
+      RTPENGINE_ADDRESS: ${RTPENGINE_ADDRESS:-}
+      WEBRTC_SERVICE_HOST: ${WEBRTC_SERVICE_HOST:-}
+      WEBRTC_CALLBACK_SCHEME: ${WEBRTC_CALLBACK_SCHEME:-}
+      WEBRTC_CALLBACK_PATH: ${WEBRTC_CALLBACK_PATH:-}
     volumes:
-      # Whole project (read-only): sip_code/ (committed default) + optional,
-      # gitignored config/ (server-managed overrides) + docker/entrypoint.
-      - ..:/etc/siphon/repo:ro
-      # Provider/SBC catalog — same files arnacon-webrtc-service reads.
-      - ${WEBRTC_GLOBAL_CONFIG_SOURCE:-/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json}:/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json:ro
-      - ${WEBRTC_SERVICES_SOURCE:-/etc/webrtcservice/node_modules/arnacon-webrtc-service/services}:/etc/webrtcservice/node_modules/arnacon-webrtc-service/services:ro
-      # TLS certs (Let's Encrypt) referenced by siphon.yaml.
+      # Entrypoint is COPY'd into the image — mount so host edits apply without rebuild.
+      - ../docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
+      - ../sip_code/siphon.yaml:/etc/siphon/siphon.yaml:ro
+      - ../sip_code/http.yaml:/etc/siphon/http.yaml:ro
+      - ../sip_code/siphon_app.py:/etc/siphon/scripts/siphon_app.py:ro
+      - ../sip_code/policy.py:/etc/siphon/scripts/policy.py:ro
+      - ../sip_code/client_ingress.py:/etc/siphon/scripts/client_ingress.py:ro
+      - ../sip_code/extension_hunt.py:/etc/siphon/scripts/extension_hunt.py:ro
+      - ../sip_code/webrtc_pc.py:/etc/siphon/scripts/webrtc_pc.py:ro
+      - ../sip_code/identity.py:/etc/siphon/scripts/identity.py:ro
+      - ../sip_code/logic_client.py:/etc/siphon/scripts/logic_client.py:ro
+      - ../sip_code/notify_push.py:/etc/siphon/scripts/notify_push.py:ro
+      - ../sip_code/media_worker.py:/etc/siphon/scripts/media_worker.py:ro
+      - ../sip_code/webrtc_pc_worker.py:/etc/siphon/scripts/webrtc_pc_worker.py:ro
+      - ${SIPHON_CONFIG_SOURCE:-../sip_code/config.json}:/etc/arnacon/config.json:ro
+      - ${SIPHON_CONFIG_SOURCE:-../sip_code/config.json}:/etc/siphon/config.json:ro
+      - ${GCP_SERVICE_ACCOUNT_JSON_FILE:-../sip_code/secrets/kamailio-gcp-mapping-sa.json}:/etc/kamailio/sip_code/secrets/kamailio-gcp-mapping-sa.json:ro
+      - ${LIGHTPBX_GROK_JSON:-../sip_code/secrets/lightpbx-grok.json}:/etc/kamailio/sip_code/secrets/lightpbx-grok.json:ro
+      - ${ARNASERVER_MASK:-./arnaserver-mask}:/usr/local/bin/arnaserver-mask:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Scratch only. The host engine reads the wav while it plays, then siphon deletes it.
+      - /var/lib/siphon-voicemail:/var/lib/siphon-voicemail
+      # siphon-rtp writes the caller pcap here (ProtectSystem). Read-only in the container.
+      - /var/lib/siphon-rtp:/var/lib/siphon-rtp:ro
+    # Client /notify: SIPhon :9001 secnum, :9002 lightpbx — stop Node binding those ports.

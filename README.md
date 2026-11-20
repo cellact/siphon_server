@@ -1,140 +1,78 @@
-# test2_kamailio (SIPhon)
+# test2_kamailio (SIPhon edge)
 
-The SIP plane for the Arnacon WebRTC stack. This used to be Kamailio
-(`ron_kamailio.cfg` + `kamailio.py`); it is now **SIPhon** — a single Rust
-binary driven by one `siphon.yaml` plus one hot-reloaded Python policy script.
-
-The `arnacon-webrtc-service` is unchanged: it still speaks SIP-over-WSS via
-sip.js, still owns FCM / blockchain / werift media. SIPhon is just the router +
-RTPEngine driver it connects to, and it can run on a separate box.
+Kamailio has been replaced by [SIPhon](https://github.com/siphon-project/siphon-sip).
+This folder is the Arnacon SIP edge: WSS/TLS facing `arnacon-webrtc-service`, TLS to the carrier SBC, media via rtpengine.
 
 ## Layout
 
-- `sip_code/` — the SIP-engine code (named generically so it's interchangeable
-  for any SIP stack, not just SIPhon).
-  - `siphon.yaml` — listeners (wss/tls/udp/tcp), TLS cert, RTPEngine media
-    profiles, registrar, NAT, script path. Uses `${VAR}` env expansion.
-  - `arnacon_policy.py` — the whole routing brain (proxy for REGISTER/OPTIONS,
-    B2BUA for calls: WebRTC↔SBC, OpenAI bridge, inbound park/resume).
-  - `config.json` — committed **default** per-env SIP source (domain/IPs/ports/
-    cert path + `webrtcServiceHost`). See `config.md`.
-  - `config.example.json`, `config.md`.
-- `config/` — **gitignored**, server-managed. Drop a `config/config.json` here
-  on each box; it **takes precedence** over `sip_code/config.json`. This lets
-  each deployment own its IPs/domain/cert path without touching tracked files.
-- `docker/`
-  - `docker-compose.yml` — builds SIPhon from a pinned git context (BuildKit
-    fetches the source), mounts the repo (`sip_code/` + optional `config/`),
-    host network.
-  - `docker-entrypoint.sh` — picks the active `config.json` (config/ over
-    sip_code/), exports `SIPHON_*` env from it, then `exec siphon --config`.
-- `certs/` — local cert material (prod uses `/etc/letsencrypt`).
+- `sip_code/siphon.yaml` — listeners, TLS, rtpengine profiles, registrar, `extensions.http`
+- `sip_code/http.yaml` — HTTPS `:9001` secnum client `/notify`
+- `sip_code/siphon_app.py` — B2BUA / REGISTER / REFER + imports client ingress
+- `sip_code/client_ingress.py` / `identity.py` / `logic_client.py` / `notify_push.py` — client `/notify` path (replaces Node on 9001)
+- `sip_code/policy.py` — provider catalog, SBC detect, webrtc `/inbound-call` callbacks
+- `sip_code/config.json` — env-specific bind/domain/certs/rtpengine/callback + `clientIngress`
+- `docker/` — image + compose (host network); builds `siphon-bin --features http`
 
-## Prerequisites
-
-- Docker with BuildKit (default on modern Docker). The compose `build.context`
-  is a **git URL** pinned to a SIPhon commit, so BuildKit fetches and builds the
-  SIPhon source itself — no local clone needed. Bump the ref in
-  `docker/docker-compose.yml` (or use `#main`) to track upstream.
-- RTPEngine reachable from the SIPhon box. Configure endpoint via
-  `rtpengineAddress` in `config.json` (`127.0.0.1:22222` local or remote
-  `host:port` NG endpoint).
-- TLS certs at `tlsCertPath` (Let's Encrypt `fullchain.pem` + `privkey.pem`).
-
-## Config injection
-
-The active `config.json` is resolved at container start, first match wins:
-
-1. `config/config.json` — server-managed, gitignored
-2. `sip_code/config.json` — committed default
-3. or override with the `SIPHON_CONFIG_JSON` env var (absolute path)
-
-`docker-entrypoint.sh` reads `<active config>[$DEPLOY_ENV].common` and exports:
-
-| config.json key   | exported env       | used by                                |
-| ----------------- | ------------------ | -------------------------------------- |
-| `domain`          | `SIPHON_DOMAIN`    | siphon.yaml (cert CN / advertise / local domain) |
-| `publicIp`        | `SIPHON_PUBLIC_IP` | siphon.yaml `advertised_address`       |
-| `bindIp`          | `SIPHON_BIND_IP`   | siphon.yaml listener bind              |
-| `wssPort`         | `SIPHON_WSS_PORT`  | siphon.yaml wss listener               |
-| `tlsCertPath`     | `TLS_CERT_PATH`    | siphon.yaml TLS cert/key               |
-| `rtpengineAddress`| `RTPENGINE_ADDRESS`| siphon.yaml RTPEngine NG endpoint      |
-| `globalServiceConfigPath` | `SIPHON_GLOBAL_CONFIG_JSON` | arnacon_policy.py catalog load |
-
-`webrtcServiceHost` is read directly by the policy for the `/inbound-call`
-callback. SIPhon expands the `${VAR}` refs in `siphon.yaml` at load.
+Upstream SIPhon is **cloned from GitHub inside the Docker build** (`siphon-bin --features http`). No local `siphon-source` checkout required on the host.
 
 ## Run (Docker)
 
-First start / image rebuild:
+From this repo (`/etc/kamailio` on the server, or `test2_kamailio` locally):
 
 ```bash
-cd /path/to/test2Server/test2_kamailio
-DEPLOY_ENV=production docker compose -f docker/docker-compose.yml up -d --build siphon
+cd docker
+DEPLOY_ENV=development docker compose build
+DEPLOY_ENV=development docker compose up -d
+docker logs -f test2_siphon
 ```
 
-Config-only redeploy (siphon.yaml / policy / config.json are mounted, so a
-restart re-reads them; the policy also hot-reloads on change):
+Optional pin:
 
 ```bash
-cd /path/to/test2Server/test2_kamailio
-DEPLOY_ENV=production docker compose -f docker/docker-compose.yml restart siphon
+SIPHON_GIT_REF=main DEPLOY_ENV=development docker compose build
 ```
 
-Validate the YAML loads (dry run):
+Production:
 
 ```bash
-cd /path/to/test2Server/test2_kamailio
-DEPLOY_ENV=production docker compose -f docker/docker-compose.yml \
-  run --rm --entrypoint /usr/local/bin/siphon siphon --config /etc/siphon/repo/sip_code/siphon.yaml --check
+cd docker
+DEPLOY_ENV=production docker compose build
+DEPLOY_ENV=production docker compose up -d
 ```
 
-Logs:
+Compose build context is the **repo root** (parent of `docker/`). Dockerfile copies `sip_code/` and clones https://github.com/siphon-project/siphon-sip.git.
+
+## Config
+
+`sip_code/config.json` remains the source of truth. The entrypoint exports `SIPHON_*` env vars (domain, bind IP, WSS port, TLS cert path, rtpengine address, webrtc callback host). SIPhon expands `${VAR}` inside `siphon.yaml`.
+
+JSON keys such as `kamailioWssPort` are kept for compatibility with existing webrtc global config wiring.
+
+Env overrides:
+
+- `SIPHON_CONFIG_PATH`
+- `SIPHON_GLOBAL_CONFIG_PATH`
+- `RTPENGINE_ADDRESS`
+- `WEBRTC_SERVICE_HOST`
+- `WEBRTC_CALLBACK_SCHEME`
+- `WEBRTC_CALLBACK_PATH`
+
+## Call flows (parity)
+
+| Flow | Behavior |
+|---|---|
+| Secnum client `/notify` :9001 | HTTPS offer → auth → route SBC/webrtc → rtpengine answer SDP (Node public notify disabled) |
+| Outbound WebRTC → SBC (WSS) | WSS INVITE → From rewrite → rtpengine `webrtc_to_sbc` → TLS :5061 SBC |
+| Inbound SBC → WebRTC | trusted SBC INVITE → HTTP `/inbound-call` → 180 + wait REGISTER → dial WSS contact |
+| REGISTER | usrloc save + wake suspended inbound |
+| REFER | callback to webrtc-service; local-bridge / pass-through / external-sip |
+
+**Cutover:** stop Node secnum from binding 9001 (`publicNotifyDisabled` / `notifyOwner: siphon` in globalserviceconfig). Point Android notify URL at SIPhon `:9001`.
+
+## Verify
 
 ```bash
-docker compose -f docker/docker-compose.yml logs -f siphon
+docker logs test2_siphon --tail 200
+# WSS target used by arnacon-webrtc-service should still be host:kamailioWssPort (8443)
+curl -sk https://127.0.0.1:9001/healthz
 ```
-
-Per-server config: create `config/config.json` (gitignored) with this box's
-`development`/`production` block — it overrides `sip_code/config.json`
-automatically, no compose changes needed. Catalog overrides still available:
-
-```bash
-DEPLOY_ENV=production
-WEBRTC_GLOBAL_CONFIG_SOURCE=/shared/runtime/globalserviceconfig.json
-WEBRTC_SERVICES_SOURCE=/shared/runtime/services
-```
-
-## Split-server deployment
-
-SIPhon and `arnacon-webrtc-service` can run on different boxes:
-
-- **webrtc-service → SIPhon**: set the service's `kamailioWssHost` /
-  `kamailioWssPort` to SIPhon's **public IP** + `wssPort`.
-- **SIPhon → webrtc-service**: set `webrtcServiceHost` in `config.json` to the
-  service box IP. Callback ports come from the service catalog.
-- **RTPEngine** can be remote. Set `rtpengineAddress` in `config.json` to the
-  remote NG endpoint (for example `3.125.225.232:2223`), allow SIPhon to reach
-  that port, and open RTPEngine media UDP range (typically `20000-40000`) to
-  and from the webrtc-service and SBC peers.
-
-## Smoke tests (do these first, in order)
-
-1. **WSS handshake + framing**: one REGISTER + one INVITE from the real
-   webrtc-service through SIPhon's WSS listener.
-2. **`wss_to_rtp`/custom profiles**: verify werift accepts the SDP SIPhon
-   produces (ICE/DTLS/BUNDLE). If werift rejects a missing
-   `a=group:BUNDLE`, re-add it (the old cfg did the same hack).
-3. **Inbound park/resume**: confirm `@registrar.on_change` resolves the parked
-   A-leg INVITE when the woken client REGISTERs (60s timeout).
-
-## Notes
-
-- `DEPLOY_ENV` defaults to `development`.
-- Keep `config.json` as the single source of truth for env-specific values; keep
-  provider/SBC/trusted-IP data in `globalserviceconfig.json` so SIPhon and the
-  webrtc-service never drift.
-- REGISTER auth is intentionally bypassed in the policy (crypto is validated
-  client/service-side), matching the previous Kamailio behaviour.
-- Prepaid per-call cutoff now lives in `arnacon-webrtc-service` (it owns the
-  minute counter); the old `Limit`-header path is gone.

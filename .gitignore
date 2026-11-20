@@ -1,12 +1,9 @@
 node_modules/
 .env
 .env.*
+sip_code/secrets/
 
-# Server-managed SIP config overrides. Drop your own config.json (and certs, etc.)
-# in config/ on each server; it takes precedence over the committed sip_code/config.json.
-config/
-
-# TLS/certificate material (never commit private keys)
+# TLS material. Never commit private keys.
 certs/
 *.key
 *privkey*.pem

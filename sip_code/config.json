@@ -1,14 +1,85 @@
 {
   "development": {
     "common": {
-      "domain": "test2.cellact.nl",
-      "publicIp": "3.125.225.232",
-      "bindIp": "172.31.24.141",
-      "wssPort": 8443,
-      "tlsCertPath": "/etc/letsencrypt/live/test2.cellact.nl",
-      "rtpengineAddress": "3.125.225.232:2223",
-      "webrtcServiceHost": "172.31.24.141",
-      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+      "domain": "srv921000.hstgr.cloud",
+      "publicIp": "82.198.225.48",
+      "bindIp": "82.198.225.48",
+      "tlsCertPath": "/etc/letsencrypt/live/srv921000.hstgr.cloud",
+      "kamailioWssPort": 8443,
+      "rtpengineAddress": "127.0.0.1:22222",
+      "webrtcServiceHost": "127.0.0.1",
+      "callbackScheme": "https",
+      "callbackPath": "/inbound-call",
+      "domainServiceAliases": {
+        "lightpbx.global": "lightpbx"
+      },
+      "providers": {
+        "secnum": {
+          "status": "active",
+          "domains": ["secnumtest.global", "secnum.global"],
+          "trustedIngressIps": ["51.85.90.127"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061,
+          "outboundSbcShim": {
+            "enabled": true,
+            "host": "127.0.0.1",
+            "port": 15061,
+            "transport": "tls"
+          }
+        },
+        "lightpbx": {
+          "status": "active",
+          "domains": ["lightpbx.global"],
+          "trustedIngressIps": ["51.85.90.127", "3.66.95.165"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061
+        },
+        "esimera": {
+          "status": "active",
+          "domains": ["esimeratest.global", "esimera.global"],
+          "trustedIngressIps": ["51.85.90.127"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061
+        }
+      },
+      "clientIngress": {
+        "owner": "siphon",
+        "logicProviders": [
+          {
+            "id": "secnum",
+            "baseUrl": "https://europe-west1-arnacon-staging-production.cloudfunctions.net/secnum-buisness-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9001,
+            "smsUrl": "https://europe-west1-arnacon-staging-production.cloudfunctions.net/la-sms-client-outbound"
+          },
+          {
+            "id": "lightpbx",
+            "baseUrl": "https://europe-west1-arnacon-staging-production.cloudfunctions.net/lightpbx-buisness-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9002
+          },
+          {
+            "id": "esimera",
+            "baseUrl": "https://europe-west1-arnacon-staging-production.cloudfunctions.net/esimera-business-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9003
+          }
+        ],
+        "openaiDtmf": {
+          "port": 7777,
+          "path": "/open-ai-entrypoint"
+        }
+      },
+      "sbcOutbound": {
+        "port": 5061,
+        "shim": {
+          "enabled": true,
+          "host": "127.0.0.1",
+          "port": 15061,
+          "transport": "tls",
+          "comment": "TLS→TLS OpenSSL shim — SIPhon dials TLS (Via/Contact TLS:5061); shim dials RSA-kx SBC"
+        }
+      }
     }
   },
   "production": {
@@ -16,11 +87,83 @@
       "domain": "ron1.cellact.nl",
       "publicIp": "51.17.152.103",
       "bindIp": "172.31.6.219",
-      "wssPort": 8443,
       "tlsCertPath": "/etc/letsencrypt/live/ron1.cellact.nl",
-      "rtpengineAddress": "127.0.0.1:22222",
+      "kamailioWssPort": 8443,
+      "rtpengineAddress": "172.17.0.1:2223",
       "webrtcServiceHost": "172.31.6.219",
-      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+      "callbackScheme": "https",
+      "callbackTlsVerify": false,
+      "callbackPath": "/inbound-call",
+      "domainServiceAliases": {
+        "lightpbx.global": "lightpbx"
+      },
+      "providers": {
+        "secnum": {
+          "status": "active",
+          "domains": ["secnumtest.global", "secnum.global"],
+          "trustedIngressIps": ["51.85.90.127"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061,
+          "outboundSbcShim": {
+            "enabled": false,
+            "host": "127.0.0.1",
+            "port": 15061,
+            "transport": "tcp"
+          }
+        },
+        "lightpbx": {
+          "status": "active",
+          "domains": ["lightpbx.global"],
+          "trustedIngressIps": ["51.85.90.127", "3.66.95.165"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061
+        },
+        "esimera": {
+          "status": "active",
+          "domains": ["esimera.global", "esimeratest.global"],
+          "trustedIngressIps": ["51.85.90.127"],
+          "outboundSbcAddress": "185.62.121.10",
+          "outboundSbcPort": 5061
+        }
+      },
+      "clientIngress": {
+        "owner": "siphon",
+        "logicProviders": [
+          {
+            "id": "secnum",
+            "baseUrl": "https://europe-west1-arnacon-production-gcp.cloudfunctions.net/secnum-buisness-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9001,
+            "smsUrl": "https://europe-west1-arnacon-production-gcp.cloudfunctions.net/la-sms-client-outbound"
+          },
+          {
+            "id": "lightpbx",
+            "baseUrl": "https://europe-west1-arnacon-production-gcp.cloudfunctions.net/lightpbx-buisness-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9002
+          },
+          {
+            "id": "esimera",
+            "baseUrl": "https://europe-west1-arnacon-production-gcp.cloudfunctions.net/esimera-business-logic-wrapper",
+            "timeoutMs": 15000,
+            "notifyPort": 9003
+          }
+        ],
+        "openaiDtmf": {
+          "port": 7777,
+          "path": "/open-ai-entrypoint"
+        }
+      },
+      "sbcOutbound": {
+        "port": 5061,
+        "shim": {
+          "enabled": true,
+          "host": "127.0.0.1",
+          "port": 15061,
+          "transport": "tls",
+          "comment": "TLS→TLS OpenSSL shim — SIPhon dials TLS (Via/Contact TLS:5061); shim dials RSA-kx SBC"
+        }
+      }
     }
   }
 }

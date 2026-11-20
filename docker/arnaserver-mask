@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Replace phone numbers on stdin with h:<12 hex of SHA256(digits)>.
+
+Same token arnaserver uses when LOG_HASH_NUMBERS is on.
+Only a number in from/to/sip/session, or the user part of user@host.
+SSRCs, ICE priorities, SDP o= ids, and timers stay as they are.
+"""
+
+import hashlib
+import re
+import sys
+
+PHONE = re.compile(
+    r"(?P<pre>(?:(?i:from|to|did|cli|number|session|sessionid)\s*=\s*'?|sip:|sips:|tel:|\|))"
+    r"(?P<num>[*+]?\d{3,15})(?![0-9A-Za-z])"
+    r"|"
+    r"(?<![0-9A-Za-z])(?P<user>[*+]?\d{3,15})(?=@)"
+)
+
+
+def token(match):
+    raw = match.group("num") or match.group("user")
+    digits = re.sub(r"\D", "", raw)
+    digest = hashlib.sha256(digits.encode()).hexdigest()[:12]
+    hashed = "h:" + digest
+    if match.group("user"):
+        return hashed
+    return match.group("pre") + hashed
+
+
+def main():
+    for line in sys.stdin:
+        sys.stdout.write(PHONE.sub(token, line))
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

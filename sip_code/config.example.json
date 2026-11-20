@@ -4,12 +4,27 @@
       "domain": "example.domain",
       "publicIp": "127.0.0.1",
       "bindIp": "127.0.0.1",
-      "wssPort": 8443,
       "tlsCertPath": "/etc/letsencrypt/live/example.domain",
+      "kamailioWssPort": 8443,
       "rtpengineAddress": "127.0.0.1:22222",
-      "webrtcServiceHost": "127.0.0.1",
-      "providersPath": "/etc/siphon/repo/sip_code/providers.json",
-      "globalServiceConfigPath": "/etc/webrtcservice/node_modules/arnacon-webrtc-service/globalserviceconfig.json"
+      "providers": {
+        "secnum": {
+          "status": "active",
+          "domains": ["secnum.global"],
+          "trustedIngressIps": ["127.0.0.1"],
+          "outboundSbcAddress": "127.0.0.1",
+          "outboundSbcPort": 5061
+        }
+      },
+      "clientIngress": {
+        "logicProviders": [
+          {
+            "id": "secnum",
+            "baseUrl": "https://example.invalid/secnum-buisness-logic-wrapper",
+            "notifyPort": 9001
+          }
+        ]
+      }
     }
   }
 }

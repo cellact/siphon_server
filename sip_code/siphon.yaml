@@ -1,132 +1,293 @@
-# ---------------------------------------------------------------------------
-# SIPhon configuration — Arnacon WebRTC <-> SBC bridge
-#
-# Replaces the old Kamailio ron_kamailio.cfg.  All environment-specific values
-# (${VAR}) are exported by docker/docker-entrypoint.sh from the active config.json
-# before `siphon --config` is exec'd.  SIPhon expands ${VAR} / ${VAR:-default}
-# at load time.
-#
-#   SIPHON_BIND_IP    private/interface IP to bind sockets on (e.g. 172.31.x.x)
-#   SIPHON_PUBLIC_IP  public IP advertised in Via/Contact/SDP (e.g. EC2 EIP)
-#   SIPHON_DOMAIN     FQDN that matches the TLS cert CN (e.g. ron1.cellact.nl)
-#   SIPHON_WSS_PORT   WSS listener port for sip.js/WebRTC clients (e.g. 8443)
-#   TLS_CERT_PATH     Let's Encrypt live dir holding fullchain.pem + privkey.pem
-#   RTPENGINE_ADDRESS RTPEngine NG control endpoint (e.g. 127.0.0.1:22222 or
-#                     3.125.225.232:2223 for a remote media box)
-# ---------------------------------------------------------------------------
-
+# Arnacon SIPhon edge — env vars injected by docker-entrypoint from config.json
+# SBC cannot resolve SIPHON_DOMAIN (Kamailio used MY_PUBLIC_IP on TLS RR/Contact).
+# Advertise BIND_IP on tcp/tls; keep domain on wss for browsers.
+# No SIP UDP :5060 — PSTN/SBC is TLS :5061, WebRTC is WSS, hairpin is TCP :5060.
 listen:
-  # sip.js leg from arnacon-webrtc-service (secure WebSocket, shares tls: cert).
-  # Internal-only hop: end-user devices talk to the webrtc-service (FCM + werift),
-  # never to SIPhon. The service connects with wss:// to ${SIPHON_DOMAIN} so the
-  # cert validates -- point the service's kamailioWssHost at the domain, not an IP.
+  tcp:
+    - address: "${SIPHON_BIND_IP}:5060"
+      advertise: "${SIPHON_BIND_IP}"
+  tls:
+    - address: "${SIPHON_BIND_IP}:5061"
+      advertise: "${SIPHON_PUBLIC_IP}"
   wss:
     - address: "${SIPHON_BIND_IP}:${SIPHON_WSS_PORT}"
       advertise: "${SIPHON_DOMAIN}"
-  # SBC trunk + OpenAI realtime leg (SIP over TLS).
-  tls:
-    - address: "${SIPHON_BIND_IP}:5061"
-      advertise: "${SIPHON_DOMAIN}"
-  # Plain SIP — keepalives / diagnostics.
-  udp:
-    - "${SIPHON_BIND_IP}:5060"
-  tcp:
-    - "${SIPHON_BIND_IP}:5060"
 
-# Public IP stamped into Via/Contact/SDP (box binds a private IP behind 1:1 NAT).
-advertised_address: "${SIPHON_PUBLIC_IP}"
+advertised_address: "${SIPHON_BIND_IP}"
 
-# Hosts treated as "ours" (drives SipUri.is_local in the policy script).
 domain:
   local:
     - "${SIPHON_DOMAIN}"
-    - "${SIPHON_PUBLIC_IP}"
-    - "${SIPHON_BIND_IP}"
 
-# Single TLS cert for both the tls: and wss: listeners (Let's Encrypt, as before).
 tls:
   certificate: "${TLS_CERT_PATH}/fullchain.pem"
   private_key: "${TLS_CERT_PATH}/privkey.pem"
-  # sip.js browsers + most SBCs negotiate 1.2; bump to TLSv1_3 if your peers allow.
-  method: "TLSv1_2"
 
-# The routing brain. Hot-reloaded on change (no restart).
 script:
-  path: "/etc/siphon/repo/sip_code/arnacon_policy.py"
+  path: "${SIPHON_SCRIPT_PATH:-/etc/siphon/scripts/siphon_app.py}"
   reload: auto
+  # 0 = do not abort the process when a handler waits (inbound ring, SBC 200).
+  # Default 30s treats pickupEvent.wait() as a wedged pool.
+  handler_stall_abort_secs: 0
 
-# In-memory AoR -> Contact bindings. No external DB; auth is bypassed in the
-# script (crypto is validated client/service-side, same as the Kamailio setup).
+extensions:
+  # Rendered by docker-entrypoint (siphon-http does not expand ${VAR} in addon yaml).
+  http: /run/siphon/http.yaml
+
 registrar:
-  backend: memory
-  default_expires: 300
   max_expires: 3600
 
-# NAT traversal for WebRTC/roaming clients (replaces force_rport + fix_nated_*).
-nat:
-  force_rport: true
-  fix_contact: true
-  fix_register: true
-  keepalive:
-    enabled: true
-    interval_secs: 30
-    failure_threshold: 10
+b2bua:
+  default_header_policy: "transparent-b2bua@2026"
+  default_refer_mode: terminate
 
-# RTPEngine endpoint (local or remote). Custom profiles below reproduce, flag
-# for flag, the rtpengine_offer/answer calls the old cfg made by hand.
 media:
+  backend: rtpengine
+  # B2BUA stamps o=/s= from this (NOT rtpengine.sdp_name). Prod uses "-".
+  sdp_name: "-"
   rtpengine:
     address: "${RTPENGINE_ADDRESS:-127.0.0.1:22222}"
     timeout_ms: 2000
-  sdp_name: "Arnacon"
+    # 10.5 never dials this. DTMF for /action is UDP JSON:
+  # rtpengine dtmf-log-dest = 127.0.0.1:22227 (siphon_app.py).
+  events:
+    listen_addr: "127.0.0.1:22226"
+  health_check_interval_secs: 30
   profiles:
-    # OUTBOUND  WebRTC(UE) --> SBC.
-    #   offer  : present plain G.711 RTP to the SBC (strip ICE/DTLS, force PCMU/PCMA)
-    #   answer : bring DTLS-SRTP + ICE back to the browser
+    # WebRTC (sip.js/WSS) -> SBC plain RTP
     webrtc_to_sbc:
       offer:
         transport_protocol: "RTP/AVP"
         ice: "remove"
         dtls: "off"
         replace: ["origin", "session-connection"]
-        flags: ["rtcp-mux-demux", "codec-mask-OPUS", "transcode-PCMU", "transcode-PCMA"]
-        direction: ["external", "internal"]
+        direction: ["local", "pub"]
+        rtcp_mux: ["demux"]
+        flags:
+          - "SIP-source-address"
+          - "endpoint-learning=immediate"
+          - "codec-mask-OPUS"
+          - "transcode-PCMU"
+          - "transcode-PCMA"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
       answer:
-        transport_protocol: "RTP/SAVPF"
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
         ice: "force"
         dtls: "passive"
         replace: ["origin", "session-connection"]
-        flags: ["rtcp-mux-offer"]
-        direction: ["internal", "external"]
-    # INBOUND  SBC --> WebRTC(UE).
-    #   offer  : turn the SBC's plain RTP into a WebRTC offer for the browser
-    #   answer : strip the browser's WebRTC answer back to plain RTP for the SBC
+        direction: ["pub", "local"]
+        rtcp_mux: ["offer"]
+        flags:
+          - "SDES-off"
+          - "SIP-source-address"
+          - "endpoint-learning=immediate"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+    # /notify PC2 (aiortc) -> SBC. Keep DTLS on the WebRTC leg (dtls:off on offer
+    # correlated with PC2 connectionState=failed after ice=completed).
+    # Answer MUST use trust-address: SBC 200 is bare RTP/AVP (no ICE) and raw/siphon
+    # answer with SIP-source-address → "Incomplete SDP specification".
+    pc2_to_sbc:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        # 12.5 dropped session-connection. SIP-source-address ignores c= and this
+        # siphon offer sends no received-from, so 12.5 reports no stream address.
+        replace: ["origin"]
+        direction: ["local", "pub"]
+        rtcp_mux: ["demux"]
+        flags:
+          - "SDES-off"
+          - "trust-address"
+          - "codec-mask-OPUS"
+          - "transcode-PCMU"
+          - "transcode-PCMA"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+      answer:
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
+        ice: "force"
+        # active: rtpengine initiates DTLS. aiortc-as-DTLS-client (setup:passive
+        # answer) → ice=completed + connectionState=failed; aiortc-as-server works
+        # on PC1, so keep PC2 in the passive/server role.
+        dtls: "active"
+        replace: ["origin"]
+        direction: ["pub", "local"]
+        # require: PC2/aiortc offered rtcp-mux; answer without it → setRemote fails
+        rtcp_mux: ["require"]
+        flags:
+          - "SDES-off"
+          - "trust-address"
+          - "generate-mid"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+    # SBC plain RTP -> WebRTC (inbound) & B2BUA replace_peer re-anchor.
+    # replace_peer sends park's RTP/AVP 200 (c=51.17.152.103:36964) into
+    # rtpengine answer: trust-address + direction: [pub, pub] ensures
+    # rtpengine bridges the SBC RTP leg to the new xfer NG port instead of
+    # learning 127.0.0.1 from the park TCP socket.
     sbc_to_webrtc:
       offer:
-        transport_protocol: "RTP/SAVPF"
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
         ice: "force"
         dtls: "passive"
         replace: ["origin", "session-connection"]
-        flags: ["rtcp-mux-offer", "SDES-off"]
-        direction: ["external", "internal"]
+        direction: ["pub", "pub"]
+        rtcp_mux: ["offer"]
+        flags:
+          - "SDES-off"
+          - "trust-address"
+          - "endpoint-learning=immediate"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+      answer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["pub", "pub"]
+        flags:
+          - "trust-address"
+          - "endpoint-learning=immediate"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+    # WebRTC <-> WebRTC (secnum client notify path)
+    webrtc_to_webrtc:
+      offer:
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin", "session-connection"]
+        rtcp_mux: ["offer"]
+        flags:
+          - "SDES-off"
+          - "SIP-source-address"
+          - "endpoint-learning=immediate"
+          - "detect-dtmf"
+      answer:
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin", "session-connection"]
+        rtcp_mux: ["offer"]
+        flags:
+          - "SDES-off"
+          - "SIP-source-address"
+          - "endpoint-learning=immediate"
+          - "detect-dtmf"
+
+    # PC2 (aiortc) -> OpenAI. Offer like webrtc_to_openai (PCMU + telephone-event).
+    # Answer MUST be pc2_to_sbc DTLS (rtpengine active). webrtc_to_openai answer
+    # is dtls:passive → setup:passive → aiortc DTLS-client → ice=completed
+    # connectionState=failed (silent).
+    pc2_to_openai:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin", "session-connection"]
+        direction: ["local", "pub"]
+        rtcp_mux: ["demux"]
+        flags:
+          - "codec-mask-all"
+          - "transcode-PCMU"
+          - "transcode-PCMA"
+          - "transcode-telephone-event"
+          - "always-transcode"
+          - "detect-dtmf"
+          - "SDES-off"
+          - "trust-address"
+          - "endpoint-learning=immediate"
+      answer:
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
+        ice: "force"
+        dtls: "active"
+        replace: ["origin", "session-connection"]
+        direction: ["pub", "local"]
+        rtcp_mux: ["require"]
+        flags:
+          - "SDES-off"
+          - "trust-address"
+          - "generate-mid"
+          - "endpoint-learning=immediate"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+    # OpenAI Realtime (PCMU) — WebRTC /notify or WSS caller
+    webrtc_to_openai:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin", "session-connection"]
+        direction: ["local", "pub"]
+        rtcp_mux: ["demux"]
+        flags:
+          - "codec-mask-all"
+          - "transcode-PCMU"
+          - "transcode-PCMA"
+          - "transcode-telephone-event"
+          - "always-transcode"
+          - "detect-dtmf"
+          - "SIP-source-address"
+      answer:
+        transport_protocol: "UDP/TLS/RTP/SAVPF"
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin", "session-connection"]
+        direction: ["pub", "local"]
+        rtcp_mux: ["offer"]
+        flags:
+          - "SDES-off"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+    # PSTN inbound → OpenAI.
+    # OpenAI answers PCMA even when we offer PCMU — offer both or there is
+    # no common codec and the PSTN hears silence.
+    # Both peers are off-box. local advertises the VPC address, so an answer
+    # of pub→local puts 172.31.6.219 in the SDP the SBC has to send RTP to.
+    pstn_to_openai:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin", "session-connection"]
+        direction: ["pub", "pub"]
+        rtcp_mux: ["demux"]
+        flags:
+          - "codec-mask-all"
+          - "transcode-PCMU"
+          - "transcode-PCMA"
+          - "transcode-telephone-event"
+          - "always-transcode"
+          - "detect-dtmf"
+          - "trust-address"
+          - "endpoint-learning=immediate"
       answer:
         transport_protocol: "RTP/AVP"
         ice: "remove"
         dtls: "off"
         replace: ["origin", "session-connection"]
-        direction: ["internal", "external"]
-    # OpenAI realtime bridge (extension 2005) — plain RTP/PCMU to the OpenAI edge.
-    openai_bridge:
-      offer:
-        transport_protocol: "RTP/AVP"
-        ice: "remove"
-        replace: ["origin", "session-connection"]
-        flags: ["rtcp-mux-demux", "codec-mask-all", "transcode-PCMU"]
-        direction: ["internal", "external"]
-      answer:
-        transport_protocol: "RTP/AVP"
-        replace: ["origin", "session-connection"]
-        direction: ["external", "internal"]
+        direction: ["pub", "pub"]
+        flags:
+          - "trust-address"
+          - "endpoint-learning=immediate"
+          - "transcode-telephone-event"
+          - "detect-dtmf"
+
+security:
+  trusted_cidrs:
+    - "127.0.0.1/32"
+    - "::1/128"
+    - "${TRUSTED_PEER_1_CIDR:-127.0.0.1/32}"
+    - "${TRUSTED_PEER_2_CIDR:-127.0.0.1/32}"
+    - "${SBC_CIDR:-127.0.0.1/32}"
+    - "${SBC_CIDR_2:-127.0.0.1/32}"
+    - "${SBC_CIDR_3:-127.0.0.1/32}"
 
 log:
   level: info
